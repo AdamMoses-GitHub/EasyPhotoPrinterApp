@@ -1,0 +1,35 @@
+# Conda environment
+.conda/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# App settings (QSettings writes a registry key on Windows; nothing on disk to ignore,
+# but if a portable ini-style settings file is ever added)
+*.ini
+
+# VS Code
+.vscode/launch.json
+.vscode/*.log
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp

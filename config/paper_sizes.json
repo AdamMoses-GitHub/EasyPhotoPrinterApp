@@ -1,0 +1,10 @@
+{
+  "sizes": [
+    {"name": "3.5x5\"",          "width_in": 3.5,  "height_in": 5.0},
+    {"name": "4x6\"",            "width_in": 4.0,  "height_in": 6.0},
+    {"name": "5x7\"",            "width_in": 5.0,  "height_in": 7.0},
+    {"name": "6x8\"",            "width_in": 6.0,  "height_in": 8.0},
+    {"name": "8.5x11\" (Letter)","width_in": 8.5,  "height_in": 11.0},
+    {"name": "A4",               "width_in": 8.27, "height_in": 11.69}
+  ]
+}
