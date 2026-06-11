@@ -1,7 +1,8 @@
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QRect
-from PySide6.QtGui import QPainter, QColor, QPixmap, QPen
+from PySide6.QtCore import Qt, QRect, QRectF
+from PySide6.QtGui import QPainter, QColor, QPixmap, QPen, QFont, QFontMetrics
 from core.image_processor import FitMode
+from core.photo_info import print_ppi, ppi_quality
 
 
 class PhotoCanvas(QWidget):
@@ -19,6 +20,9 @@ class PhotoCanvas(QWidget):
         self._print_h_in: float = 6.0
         self._cut_markers: bool = False
         self._fit_mode: FitMode = FitMode.FILL
+        self._crop_shadow: bool = False
+        self._photo_info: dict | None = None
+        self._paper_shadow: bool = True
 
     def set_photo(self, path: str):
         self._photo_path = path
@@ -28,6 +32,7 @@ class PhotoCanvas(QWidget):
     def clear_photo(self):
         self._photo_path = None
         self._pixmap = None
+        self._photo_info = None
         self.update()
 
     def set_paper(self, paper_w_in: float, paper_h_in: float):
@@ -48,6 +53,18 @@ class PhotoCanvas(QWidget):
         self._fit_mode = mode
         self.update()
 
+    def set_crop_shadow(self, enabled: bool):
+        self._crop_shadow = enabled
+        self.update()
+
+    def set_photo_info(self, info: dict | None):
+        self._photo_info = info
+        self.update()
+
+    def set_paper_shadow(self, enabled: bool):
+        self._paper_shadow = enabled
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -55,7 +72,12 @@ class PhotoCanvas(QWidget):
 
         w = self.width()
         h = self.height()
-        padding = 24
+
+        # When crop-shadow is active in Fill mode we reserve extra margin so
+        # the overflowing image parts are visible outside the paper edge.
+        _SHADOW_EXTRA = 48
+        show_cs = self._crop_shadow and self._fit_mode == FitMode.FILL
+        padding = 24 + (_SHADOW_EXTRA if show_cs else 0)
 
         # Gray background
         painter.fillRect(0, 0, w, h, QColor(210, 210, 210))
@@ -75,18 +97,46 @@ class PhotoCanvas(QWidget):
         paper_x = (w - paper_w_px) // 2
         paper_y = (h - paper_h_px) // 2
 
-        # Drop shadow
-        painter.fillRect(paper_x + 4, paper_y + 4, paper_w_px, paper_h_px, QColor(160, 160, 160))
-
-        # White paper
-        painter.fillRect(paper_x, paper_y, paper_w_px, paper_h_px, Qt.GlobalColor.white)
-
-        # --- Print area rect ---
+        # --- Print area geometry (needed before drawing photo) ---
         scale_px_per_in = paper_w_px / self._paper_w_in
         print_w_px = int(self._print_w_in * scale_px_per_in)
         print_h_px = int(self._print_h_in * scale_px_per_in)
         print_x = paper_x + (paper_w_px - print_w_px) // 2
         print_y = paper_y + (paper_h_px - print_h_px) // 2
+
+        # --- Draw crop-shadow overflow first (behind paper) ---
+        _SHADOW_COLOR = QColor(30, 100, 220, 170)   # blue tint
+        if show_cs and self._pixmap and not self._pixmap.isNull():
+            scaled_cs = self._pixmap.scaled(
+                print_w_px, print_h_px,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x_off = (scaled_cs.width() - print_w_px) // 2
+            y_off = (scaled_cs.height() - print_h_px) // 2
+            if x_off > 0 or y_off > 0:
+                # Draw the full image (with overflow) outside the paper
+                draw_x = print_x - x_off
+                draw_y = print_y - y_off
+                painter.drawPixmap(draw_x, draw_y, scaled_cs)
+                # Blue overlay on the overflow strips
+                painter.fillRect(draw_x, draw_y, scaled_cs.width(), scaled_cs.height(),
+                                  _SHADOW_COLOR)
+
+        # Drop shadow (paper) — soft multi-layer simulation
+        if self._paper_shadow:
+            layers = 10
+            for i in range(layers, 0, -1):
+                alpha = int(80 * (i / layers) ** 2)  # quadratic falloff
+                offset = i + 2
+                painter.fillRect(
+                    paper_x + offset, paper_y + offset,
+                    paper_w_px, paper_h_px,
+                    QColor(60, 60, 60, alpha),
+                )
+
+        # White paper (drawn on top, covering the outside-paper overflow)
+        painter.fillRect(paper_x, paper_y, paper_w_px, paper_h_px, Qt.GlobalColor.white)
 
         # --- Draw photo or placeholder ---
         if self._pixmap and not self._pixmap.isNull():
@@ -98,11 +148,40 @@ class PhotoCanvas(QWidget):
                 )
                 x_off = (scaled.width() - print_w_px) // 2
                 y_off = (scaled.height() - print_h_px) // 2
-                painter.drawPixmap(
-                    QRect(print_x, print_y, print_w_px, print_h_px),
-                    scaled,
-                    QRect(x_off, y_off, print_w_px, print_h_px),
-                )
+
+                if show_cs and (x_off > 0 or y_off > 0):
+                    # Overflow is already drawn behind the paper.
+                    # Now draw the overflow image ON the paper with blue tint
+                    # (for the strips between print area and paper edge in custom-area mode).
+                    painter.save()
+                    painter.setClipRect(paper_x, paper_y, paper_w_px, paper_h_px)
+                    painter.drawPixmap(print_x - x_off, print_y - y_off, scaled)
+                    painter.restore()
+                    # Blue overlay on the in-paper strips outside the print area
+                    if print_y > paper_y:
+                        painter.fillRect(paper_x, paper_y, paper_w_px, print_y - paper_y, _SHADOW_COLOR)
+                    bottom_start = print_y + print_h_px
+                    if bottom_start < paper_y + paper_h_px:
+                        painter.fillRect(paper_x, bottom_start, paper_w_px,
+                                         (paper_y + paper_h_px) - bottom_start, _SHADOW_COLOR)
+                    if print_x > paper_x:
+                        painter.fillRect(paper_x, print_y, print_x - paper_x, print_h_px, _SHADOW_COLOR)
+                    right_start = print_x + print_w_px
+                    if right_start < paper_x + paper_w_px:
+                        painter.fillRect(right_start, print_y,
+                                         (paper_x + paper_w_px) - right_start, print_h_px, _SHADOW_COLOR)
+                    # Bright print area on top
+                    painter.drawPixmap(
+                        QRect(print_x, print_y, print_w_px, print_h_px),
+                        scaled,
+                        QRect(x_off, y_off, print_w_px, print_h_px),
+                    )
+                else:
+                    painter.drawPixmap(
+                        QRect(print_x, print_y, print_w_px, print_h_px),
+                        scaled,
+                        QRect(x_off, y_off, print_w_px, print_h_px),
+                    )
             elif self._fit_mode == FitMode.FIT:
                 painter.fillRect(print_x, print_y, print_w_px, print_h_px, Qt.GlobalColor.white)
                 scaled = self._pixmap.scaled(
@@ -161,4 +240,80 @@ class PhotoCanvas(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(paper_x, paper_y, paper_w_px - 1, paper_h_px - 1)
 
+        # --- Info overlay (bottom-left of canvas) ---
+        if self._photo_info:
+            self._draw_info_overlay(painter, w, h)
+
         painter.end()
+
+    def _draw_info_overlay(self, painter: QPainter, canvas_w: int, canvas_h: int):
+        info = self._photo_info
+        pw, ph = info.get("pixel_w", 0), info.get("pixel_h", 0)
+        print_w_in = self._print_w_in
+        print_h_in = self._print_h_in
+
+        ppi = print_ppi(pw, ph, print_w_in, print_h_in) if pw and ph else 0
+        quality = ppi_quality(ppi) if ppi else "low"
+
+        # DPI color
+        dpi_color = {
+            "good": QColor(80, 200, 100),
+            "ok":   QColor(240, 190, 40),
+            "low":  QColor(220, 60, 60),
+        }[quality]
+
+        # Build lines
+        size_bytes = info.get("file_size", 0)
+        if size_bytes >= 1_048_576:
+            size_str = f"{size_bytes / 1_048_576:.1f} MB"
+        else:
+            size_str = f"{size_bytes / 1024:.0f} KB"
+
+        mod = info.get("modified")
+        mod_str = mod.strftime("%Y-%m-%d  %H:%M") if mod else "—"
+
+        lines_normal = [
+            info.get("filename", ""),
+            f"{pw} × {ph} px   {info.get('ratio', '—')}   {info.get('color_mode', '—')}",
+            f"{size_str}   {mod_str}",
+        ]
+        # Camera line (optional)
+        make = info.get("camera_make") or ""
+        model = info.get("camera_model") or ""
+        if model:
+            camera = model if model.startswith(make) else f"{make} {model}".strip()
+            lines_normal.append(camera)
+
+        # DPI line drawn separately in color
+        dpi_line = f"Print PPI: {ppi}  ({'Good' if quality == 'good' else 'OK' if quality == 'ok' else 'Low — may appear blurry'})" if ppi else "Print PPI: —"
+
+        font = QFont("Segoe UI", 8)
+        painter.setFont(font)
+        fm = QFontMetrics(font)
+        line_h = fm.height() + 2
+
+        all_lines = lines_normal + [dpi_line]
+        box_w = max(fm.horizontalAdvance(l) for l in all_lines) + 16
+        box_h = line_h * len(all_lines) + 12
+
+        margin = 10
+        box_x = margin
+        box_y = canvas_h - box_h - margin
+
+        # Background
+        bg = QColor(20, 20, 20, 190)
+        painter.setBrush(bg)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(QRectF(box_x, box_y, box_w, box_h), 6, 6)
+
+        # Normal lines — white
+        painter.setPen(QColor(255, 255, 255))
+        for i, line in enumerate(lines_normal):
+            y = box_y + 8 + i * line_h + fm.ascent()
+            painter.drawText(box_x + 8, y, line)
+
+        # DPI line — colored
+        painter.setPen(dpi_color)
+        y = box_y + 8 + len(lines_normal) * line_h + fm.ascent()
+        painter.drawText(box_x + 8, y, dpi_line)
+

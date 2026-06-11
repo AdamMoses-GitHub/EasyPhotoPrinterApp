@@ -16,6 +16,7 @@ from PIL import Image
 from ui.photo_canvas import PhotoCanvas
 from ui.thumbnail_bar import ThumbnailBar
 from core.image_processor import FitMode, render_image
+from core.photo_info import read_photo_info
 
 _CONFIG = Path(__file__).parent.parent / "config" / "paper_sizes.json"
 _MAX_PRINT_DPI = 600  # cap to keep memory/time reasonable
@@ -71,6 +72,15 @@ class MainWindow(QMainWindow):
         self._photo_fit_combo.setEnabled(False)
         self._photo_fit_combo.currentTextChanged.connect(self._on_photo_fit_changed)
         ol.addWidget(self._photo_fit_combo)
+
+        self._crop_shadow_chk = QCheckBox("Show crop shadow")
+        self._crop_shadow_chk.setChecked(True)
+        self._crop_shadow_chk.setToolTip(
+            "In Fill mode, dims the parts of the image that will be cropped off."
+        )
+        self._crop_shadow_chk.toggled.connect(self._on_crop_shadow_toggled)
+        ol.addWidget(self._crop_shadow_chk)
+
         ol.addStretch()
         layout.addWidget(override_bar)
 
@@ -166,6 +176,11 @@ class MainWindow(QMainWindow):
         self._cut_markers_chk.toggled.connect(self._on_cut_markers_toggled)
         tb.addWidget(self._cut_markers_chk)
 
+        self._paper_shadow_chk = QCheckBox("Paper shadow")
+        self._paper_shadow_chk.setChecked(True)
+        self._paper_shadow_chk.toggled.connect(self._on_paper_shadow_toggled)
+        tb.addWidget(self._paper_shadow_chk)
+
         tb.addSeparator()
 
         self._print_btn = QPushButton("Print All")
@@ -189,6 +204,16 @@ class MainWindow(QMainWindow):
         cut_markers = self._settings.value("cut_markers", False, type=bool)
         orient = self._settings.value("orientation", "Auto")
         global_fit = self._settings.value("global_fit", FitMode.FILL.value)
+        crop_shadow = self._settings.value("crop_shadow", True, type=bool)
+        paper_shadow = self._settings.value("paper_shadow", True, type=bool)
+
+        self._paper_shadow_chk.blockSignals(True)
+        self._paper_shadow_chk.setChecked(paper_shadow)
+        self._paper_shadow_chk.blockSignals(False)
+
+        self._crop_shadow_chk.blockSignals(True)
+        self._crop_shadow_chk.setChecked(crop_shadow)
+        self._crop_shadow_chk.blockSignals(False)
 
         self._global_fit_combo.blockSignals(True)
         idx = self._global_fit_combo.findText(global_fit)
@@ -260,6 +285,7 @@ class MainWindow(QMainWindow):
         self._photo_overrides.clear()
         self._thumb_bar.set_photos([])
         self._canvas.clear_photo()
+        self._canvas.set_photo_info(None)
         self._photo_fit_combo.blockSignals(True)
         self._photo_fit_combo.setCurrentIndex(0)
         self._photo_fit_combo.blockSignals(False)
@@ -271,6 +297,7 @@ class MainWindow(QMainWindow):
     def _on_photo_selected(self, index: int, path: str):
         self._current_index = index
         self._canvas.set_photo(path)
+        self._canvas.set_photo_info(read_photo_info(path))
         # Restore per-photo override in the combo without triggering a write-back
         override = self._photo_overrides.get(index)
         self._photo_fit_combo.blockSignals(True)
@@ -300,6 +327,14 @@ class MainWindow(QMainWindow):
         else:
             self._photo_overrides[self._current_index] = text
         self._update_canvas_settings()
+
+    def _on_crop_shadow_toggled(self, checked: bool):
+        self._canvas.set_crop_shadow(checked)
+        self._settings.setValue("crop_shadow", checked)
+
+    def _on_paper_shadow_toggled(self, checked: bool):
+        self._canvas.set_paper_shadow(checked)
+        self._settings.setValue("paper_shadow", checked)
 
     def _on_paper_changed(self):
         self._update_canvas_settings()
@@ -396,6 +431,8 @@ class MainWindow(QMainWindow):
             self._canvas.set_print_area(aw, ah)
             self._canvas.set_cut_markers(self._cut_markers_chk.isChecked())
         self._canvas.set_fit_mode(self._effective_fit_mode(self._current_index))
+        self._canvas.set_crop_shadow(self._crop_shadow_chk.isChecked())
+        self._canvas.set_paper_shadow(self._paper_shadow_chk.isChecked())
 
     # ------------------------------------------------------------------
     # Printing
