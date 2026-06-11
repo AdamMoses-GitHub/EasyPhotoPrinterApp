@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget
-from PySide6.QtCore import Qt, QRect, QRectF
-from PySide6.QtGui import QPainter, QColor, QPixmap, QPen, QFont, QFontMetrics
+from PySide6.QtCore import Qt, QRect, QRectF, QPoint, Signal
+from PySide6.QtGui import QPainter, QColor, QPixmap, QPen, QFont, QFontMetrics, QCursor
 from core.image_processor import FitMode
 from core.photo_info import print_ppi, ppi_quality
 
@@ -8,9 +8,12 @@ from core.photo_info import print_ppi, ppi_quality
 class PhotoCanvas(QWidget):
     """Displays the paper, print area, and photo preview."""
 
+    pan_changed = Signal(float, float)  # emitted on drag release: (pan_x, pan_y)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(400, 400)
+        self.setMouseTracking(True)
 
         self._photo_path: str | None = None
         self._pixmap: QPixmap | None = None
@@ -23,6 +26,15 @@ class PhotoCanvas(QWidget):
         self._crop_shadow: bool = False
         self._photo_info: dict | None = None
         self._paper_shadow: bool = True
+
+        # Pan state (Fill mode only)
+        self._pan_x: float = 0.0   # -1..+1
+        self._pan_y: float = 0.0
+        self._dragging: bool = False
+        self._drag_start: QPoint = QPoint()
+        self._drag_pan_start: tuple[float, float] = (0.0, 0.0)
+        # Cached print-area screen rect, updated each paintEvent
+        self._print_rect_screen: QRect = QRect()
 
     def set_photo(self, path: str):
         self._photo_path = path
@@ -65,6 +77,11 @@ class PhotoCanvas(QWidget):
         self._paper_shadow = enabled
         self.update()
 
+    def set_pan(self, pan_x: float, pan_y: float):
+        self._pan_x = max(-1.0, min(1.0, pan_x))
+        self._pan_y = max(-1.0, min(1.0, pan_y))
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -103,6 +120,7 @@ class PhotoCanvas(QWidget):
         print_h_px = int(self._print_h_in * scale_px_per_in)
         print_x = paper_x + (paper_w_px - print_w_px) // 2
         print_y = paper_y + (paper_h_px - print_h_px) // 2
+        self._print_rect_screen = QRect(print_x, print_y, print_w_px, print_h_px)
 
         # --- Draw crop-shadow overflow first (behind paper) ---
         _SHADOW_COLOR = QColor(30, 100, 220, 170)   # blue tint
@@ -112,14 +130,16 @@ class PhotoCanvas(QWidget):
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x_off = (scaled_cs.width() - print_w_px) // 2
-            y_off = (scaled_cs.height() - print_h_px) // 2
-            if x_off > 0 or y_off > 0:
-                # Draw the full image (with overflow) outside the paper
+            total_x_off = scaled_cs.width() - print_w_px
+            total_y_off = scaled_cs.height() - print_h_px
+            x_off = total_x_off // 2 + round(self._pan_x * (total_x_off / 2))
+            y_off = total_y_off // 2 + round(self._pan_y * (total_y_off / 2))
+            x_off = max(0, min(x_off, total_x_off))
+            y_off = max(0, min(y_off, total_y_off))
+            if total_x_off > 0 or total_y_off > 0:
                 draw_x = print_x - x_off
                 draw_y = print_y - y_off
                 painter.drawPixmap(draw_x, draw_y, scaled_cs)
-                # Blue overlay on the overflow strips
                 painter.fillRect(draw_x, draw_y, scaled_cs.width(), scaled_cs.height(),
                                   _SHADOW_COLOR)
 
@@ -146,8 +166,12 @@ class PhotoCanvas(QWidget):
                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                x_off = (scaled.width() - print_w_px) // 2
-                y_off = (scaled.height() - print_h_px) // 2
+                total_x_off = scaled.width() - print_w_px
+                total_y_off = scaled.height() - print_h_px
+                x_off = total_x_off // 2 + round(self._pan_x * (total_x_off / 2))
+                y_off = total_y_off // 2 + round(self._pan_y * (total_y_off / 2))
+                x_off = max(0, min(x_off, total_x_off))
+                y_off = max(0, min(y_off, total_y_off))
 
                 if show_cs and (x_off > 0 or y_off > 0):
                     # Overflow is already drawn behind the paper.
@@ -245,6 +269,51 @@ class PhotoCanvas(QWidget):
             self._draw_info_overlay(painter, w, h)
 
         painter.end()
+
+    # ------------------------------------------------------------------
+    # Mouse interaction — pan in Fill mode
+    # ------------------------------------------------------------------
+
+    def _can_pan(self) -> bool:
+        return (
+            self._fit_mode == FitMode.FILL
+            and self._pixmap is not None
+            and not self._pixmap.isNull()
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._can_pan():
+            if self._print_rect_screen.contains(event.pos()):
+                self._dragging = True
+                self._drag_start = event.pos()
+                self._drag_pan_start = (self._pan_x, self._pan_y)
+                self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+
+    def mouseMoveEvent(self, event):
+        if self._dragging:
+            dx = event.pos().x() - self._drag_start.x()
+            dy = event.pos().y() - self._drag_start.y()
+            r = self._print_rect_screen
+            # Dragging right shifts the crop left (pan_x decreases)
+            pan_x = self._drag_pan_start[0] - (dx / (r.width()  / 2)) if r.width()  else 0
+            pan_y = self._drag_pan_start[1] - (dy / (r.height() / 2)) if r.height() else 0
+            self._pan_x = max(-1.0, min(1.0, pan_x))
+            self._pan_y = max(-1.0, min(1.0, pan_y))
+            self.update()
+        elif self._can_pan() and self._print_rect_screen.contains(event.pos()):
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+        else:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._dragging:
+            self._dragging = False
+            self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
+            self.pan_changed.emit(self._pan_x, self._pan_y)
+
+    def leaveEvent(self, event):
+        if not self._dragging:
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
     def _draw_info_overlay(self, painter: QPainter, canvas_w: int, canvas_h: int):
         info = self._photo_info

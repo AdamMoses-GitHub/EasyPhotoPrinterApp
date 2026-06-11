@@ -9,16 +9,26 @@ class FitMode(str, Enum):
 
 
 def render_image(img: Image.Image, target_w: int, target_h: int,
-                 mode: FitMode = FitMode.FILL) -> Image.Image:
-    """Render a PIL image into target_w x target_h according to the given mode."""
+                 mode: FitMode = FitMode.FILL,
+                 pan_x: float = 0.0, pan_y: float = 0.0) -> Image.Image:
+    """Render a PIL image into target_w x target_h according to the given mode.
+
+    pan_x, pan_y: fractional pan offset in [-1, 1]. Only used in FILL mode.
+    0,0 = centered; -1 = left/top edge; +1 = right/bottom edge.
+    """
     src_w, src_h = img.size
 
     if mode == FitMode.FILL:
         scale = max(target_w / src_w, target_h / src_h)
         new_w, new_h = round(src_w * scale), round(src_h * scale)
         img = img.resize((new_w, new_h), Image.LANCZOS)
-        left = (new_w - target_w) // 2
-        top  = (new_h - target_h) // 2
+        max_left = new_w - target_w
+        max_top  = new_h - target_h
+        # Center offset, then shift by pan fraction of the available overflow
+        left = max_left // 2 + round(pan_x * (max_left / 2))
+        top  = max_top  // 2 + round(pan_y * (max_top  / 2))
+        left = max(0, min(left, max_left))
+        top  = max(0, min(top,  max_top))
         return img.crop((left, top, left + target_w, top + target_h))
 
     elif mode == FitMode.FIT:

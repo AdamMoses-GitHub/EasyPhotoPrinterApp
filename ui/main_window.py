@@ -1,15 +1,14 @@
 import json
-import io
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QToolBar,
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar,
     QComboBox, QLabel, QDoubleSpinBox, QPushButton,
     QFileDialog, QCheckBox, QMessageBox, QStatusBar, QFrame,
-    QDialog,
+    QDialog, QApplication, QMenu,
 )
 from PySide6.QtCore import Qt, QSettings, QSizeF, QMarginsF
-from PySide6.QtGui import QPainter, QImage, QPageSize, QPageLayout, QTransform
+from PySide6.QtGui import QPainter, QImage, QPageSize, QPageLayout, QTransform, QPen, QColor
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 from PIL import Image
 
@@ -36,6 +35,7 @@ class MainWindow(QMainWindow):
         self._photo_paths: list[str] = []
         self._current_index: int = -1
         self._photo_overrides: dict[int, str | None] = {}  # index -> FitMode value or None
+        self._photo_pans: dict[int, tuple[float, float]] = {}  # index -> (pan_x, pan_y)
         self._paper_sizes = _load_paper_sizes()
         self._settings = QSettings("PrinterApp", "PrinterApp")
 
@@ -54,13 +54,14 @@ class MainWindow(QMainWindow):
         layout.setSpacing(0)
 
         self.addToolBar(self._build_toolbar())
+        self._build_menu_bar()
 
         self._canvas = PhotoCanvas()
+        self._canvas.pan_changed.connect(self._on_pan_changed)
         layout.addWidget(self._canvas, stretch=1)
 
         # Per-photo fit mode override bar
         override_bar = QWidget()
-        from PySide6.QtWidgets import QHBoxLayout
         ol = QHBoxLayout(override_bar)
         ol.setContentsMargins(8, 3, 8, 3)
         ol.setSpacing(6)
@@ -73,13 +74,11 @@ class MainWindow(QMainWindow):
         self._photo_fit_combo.currentTextChanged.connect(self._on_photo_fit_changed)
         ol.addWidget(self._photo_fit_combo)
 
-        self._crop_shadow_chk = QCheckBox("Show crop shadow")
-        self._crop_shadow_chk.setChecked(True)
-        self._crop_shadow_chk.setToolTip(
-            "In Fill mode, dims the parts of the image that will be cropped off."
-        )
-        self._crop_shadow_chk.toggled.connect(self._on_crop_shadow_toggled)
-        ol.addWidget(self._crop_shadow_chk)
+        self._reset_crop_btn = QPushButton("Reset crop")
+        self._reset_crop_btn.setEnabled(False)
+        self._reset_crop_btn.setToolTip("Re-center the crop (undo manual pan)")
+        self._reset_crop_btn.clicked.connect(self._on_reset_crop)
+        ol.addWidget(self._reset_crop_btn)
 
         ol.addStretch()
         layout.addWidget(override_bar)
@@ -94,6 +93,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._thumb_bar)
 
         self.setStatusBar(QStatusBar())
+
+    def _build_menu_bar(self):
+        view_menu: QMenu = self.menuBar().addMenu("&View")
+
+        self._paper_shadow_chk = view_menu.addAction("Paper shadow")
+        self._paper_shadow_chk.setCheckable(True)
+        self._paper_shadow_chk.setChecked(True)
+        self._paper_shadow_chk.toggled.connect(self._on_paper_shadow_toggled)
+
+        self._crop_shadow_action = view_menu.addAction("Show crop shadow")
+        self._crop_shadow_action.setCheckable(True)
+        self._crop_shadow_action.setChecked(True)
+        self._crop_shadow_action.setToolTip(
+            "In Fill mode, dims the parts of the image that will be cropped off."
+        )
+        self._crop_shadow_action.toggled.connect(self._on_crop_shadow_toggled)
 
     def _build_toolbar(self) -> QToolBar:
         tb = QToolBar("Main")
@@ -176,11 +191,6 @@ class MainWindow(QMainWindow):
         self._cut_markers_chk.toggled.connect(self._on_cut_markers_toggled)
         tb.addWidget(self._cut_markers_chk)
 
-        self._paper_shadow_chk = QCheckBox("Paper shadow")
-        self._paper_shadow_chk.setChecked(True)
-        self._paper_shadow_chk.toggled.connect(self._on_paper_shadow_toggled)
-        tb.addWidget(self._paper_shadow_chk)
-
         tb.addSeparator()
 
         self._print_btn = QPushButton("Print All")
@@ -211,9 +221,9 @@ class MainWindow(QMainWindow):
         self._paper_shadow_chk.setChecked(paper_shadow)
         self._paper_shadow_chk.blockSignals(False)
 
-        self._crop_shadow_chk.blockSignals(True)
-        self._crop_shadow_chk.setChecked(crop_shadow)
-        self._crop_shadow_chk.blockSignals(False)
+        self._crop_shadow_action.blockSignals(True)
+        self._crop_shadow_action.setChecked(crop_shadow)
+        self._crop_shadow_action.blockSignals(False)
 
         self._global_fit_combo.blockSignals(True)
         idx = self._global_fit_combo.findText(global_fit)
@@ -274,6 +284,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("last_open_dir", str(Path(paths[0]).parent))
         self._photo_paths = paths
         self._photo_overrides.clear()
+        self._photo_pans.clear()
         self._thumb_bar.set_photos(paths)
         self._print_btn.setEnabled(True)
         self._clear_btn.setEnabled(True)
@@ -283,6 +294,7 @@ class MainWindow(QMainWindow):
         self._photo_paths = []
         self._current_index = -1
         self._photo_overrides.clear()
+        self._photo_pans.clear()
         self._thumb_bar.set_photos([])
         self._canvas.clear_photo()
         self._canvas.set_photo_info(None)
@@ -290,6 +302,7 @@ class MainWindow(QMainWindow):
         self._photo_fit_combo.setCurrentIndex(0)
         self._photo_fit_combo.blockSignals(False)
         self._photo_fit_combo.setEnabled(False)
+        self._reset_crop_btn.setEnabled(False)
         self._print_btn.setEnabled(False)
         self._clear_btn.setEnabled(False)
         self.statusBar().showMessage("All photos cleared.")
@@ -304,12 +317,27 @@ class MainWindow(QMainWindow):
         self._photo_fit_combo.setCurrentText(override if override else "Use global setting")
         self._photo_fit_combo.blockSignals(False)
         self._photo_fit_combo.setEnabled(True)
+        # Restore pan
+        pan = self._photo_pans.get(index, (0.0, 0.0))
+        self._canvas.set_pan(pan[0], pan[1])
+        self._reset_crop_btn.setEnabled(pan != (0.0, 0.0))
         # Auto mode may flip paper orientation per photo
         self._update_canvas_settings()
         name = Path(path).name
         self.statusBar().showMessage(
             f"Photo {index + 1} / {len(self._photo_paths)}: {name}"
         )
+
+    def _on_pan_changed(self, pan_x: float, pan_y: float):
+        if self._current_index >= 0:
+            self._photo_pans[self._current_index] = (pan_x, pan_y)
+            self._reset_crop_btn.setEnabled(pan_x != 0.0 or pan_y != 0.0)
+
+    def _on_reset_crop(self):
+        if self._current_index >= 0:
+            self._photo_pans.pop(self._current_index, None)
+            self._canvas.set_pan(0.0, 0.0)
+            self._reset_crop_btn.setEnabled(False)
 
     def _on_orientation_changed(self):
         self._update_canvas_settings()
@@ -350,7 +378,6 @@ class MainWindow(QMainWindow):
         self._cut_markers_chk.setEnabled(not checked)
         if checked:
             self._cut_markers_chk.setChecked(False)
-        if checked:
             paper = self._current_paper()
             if paper:
                 self._area_w_spin.blockSignals(True)
@@ -388,16 +415,23 @@ class MainWindow(QMainWindow):
             if pw > ph:
                 pw, ph = ph, pw
         elif mode == "Auto" and photo_path:
-            try:
-                img = Image.open(photo_path)
-                iw, ih = img.size
-                img.close()
-                if iw > ih and pw < ph:   # landscape photo → landscape paper
-                    pw, ph = ph, pw
-                elif ih > iw and pw > ph: # portrait photo → portrait paper
-                    pw, ph = ph, pw
-            except Exception:
-                pass
+            # Use cached info if this is the current photo, else open via PIL
+            info = None
+            idx = self._photo_paths.index(photo_path) if photo_path in self._photo_paths else -1
+            if idx == self._current_index and self._canvas._photo_info:
+                info = self._canvas._photo_info
+                iw, ih = info.get("pixel_w", 0), info.get("pixel_h", 0)
+            else:
+                try:
+                    img = Image.open(photo_path)
+                    iw, ih = img.size
+                    img.close()
+                except Exception:
+                    iw, ih = 0, 0
+            if iw > ih and pw < ph:
+                pw, ph = ph, pw
+            elif ih > iw and pw > ph:
+                pw, ph = ph, pw
         return pw, ph
 
     def _current_photo_path(self) -> str | None:
@@ -431,7 +465,7 @@ class MainWindow(QMainWindow):
             self._canvas.set_print_area(aw, ah)
             self._canvas.set_cut_markers(self._cut_markers_chk.isChecked())
         self._canvas.set_fit_mode(self._effective_fit_mode(self._current_index))
-        self._canvas.set_crop_shadow(self._crop_shadow_chk.isChecked())
+        self._canvas.set_crop_shadow(self._crop_shadow_action.isChecked())
         self._canvas.set_paper_shadow(self._paper_shadow_chk.isChecked())
 
     # ------------------------------------------------------------------
@@ -514,12 +548,12 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     f"Printing {i + 1} / {len(self._photo_paths)}: {Path(path).name}…"
                 )
-                from PySide6.QtWidgets import QApplication
                 QApplication.processEvents()
 
                 img = Image.open(path).convert("RGB")
                 fit = self._effective_fit_mode(i)
-                cropped = render_image(img, print_w_px, print_h_px, fit)
+                pan = self._photo_pans.get(i, (0.0, 0.0))
+                cropped = render_image(img, print_w_px, print_h_px, fit, pan[0], pan[1])
                 img_bytes = cropped.tobytes("raw", "RGB")
                 qimg = QImage(
                     img_bytes,
@@ -535,9 +569,7 @@ class MainWindow(QMainWindow):
                     gap_px = int(0.1 * dpi)
                     mark_px = int(0.2 * dpi)
                     pen_w = max(1, int(dpi / 300))
-                    from PySide6.QtGui import QPen as _QPen, QColor as _QColor
-                    from PySide6.QtCore import Qt as _Qt
-                    painter.setPen(_QPen(_QColor(0, 0, 0), pen_w, _Qt.PenStyle.SolidLine))
+                    painter.setPen(QPen(QColor(0, 0, 0), pen_w, Qt.PenStyle.SolidLine))
                     corners = [
                         (offset_x,               offset_y,               -1, -1),
                         (offset_x + print_w_px,  offset_y,               +1, -1),

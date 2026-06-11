@@ -1,4 +1,3 @@
-import os
 from math import gcd
 from datetime import datetime
 from pathlib import Path
@@ -26,10 +25,6 @@ def _closest_simple_ratio(w: int, h: int) -> str:
     ratio_f = w / h
     best = min(common, key=lambda r: abs(r[0] / r[1] - ratio_f))
     return f"{best[0]}:{best[1]}"
-
-
-def _exif_tag(exif: dict, name: str) -> str | None:
-    return exif.get(name)
 
 
 def read_photo_info(path: str) -> dict:
