@@ -16,7 +16,15 @@ def render_image(img: Image.Image, target_w: int, target_h: int,
     pan_x, pan_y: fractional pan offset in [-1, 1]. Only used in FILL mode.
     0,0 = centered; -1 = left/top edge; +1 = right/bottom edge.
     """
+    if target_w <= 0 or target_h <= 0:
+        raise ValueError("target dimensions must be > 0")
+
     src_w, src_h = img.size
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError("source image dimensions must be > 0")
+
+    pan_x = max(-1.0, min(1.0, pan_x))
+    pan_y = max(-1.0, min(1.0, pan_y))
 
     if mode == FitMode.FILL:
         scale = max(target_w / src_w, target_h / src_h)

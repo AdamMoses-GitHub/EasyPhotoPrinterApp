@@ -19,11 +19,35 @@ from core.photo_info import read_photo_info
 
 _CONFIG = Path(__file__).parent.parent / "config" / "paper_sizes.json"
 _MAX_PRINT_DPI = 600  # cap to keep memory/time reasonable
+_DEFAULT_PAPER_SIZES = [
+    {"name": "3.5x5\"", "width_in": 3.5, "height_in": 5.0},
+    {"name": "4x6\"", "width_in": 4.0, "height_in": 6.0},
+    {"name": "5x7\"", "width_in": 5.0, "height_in": 7.0},
+    {"name": "6x8\"", "width_in": 6.0, "height_in": 8.0},
+    {"name": "8.5x11\" (Letter)", "width_in": 8.5, "height_in": 11.0},
+    {"name": "A4", "width_in": 8.27, "height_in": 11.69},
+]
 
 
 def _load_paper_sizes() -> list[dict]:
-    with open(_CONFIG, encoding="utf-8") as f:
-        return json.load(f)["sizes"]
+    try:
+        with open(_CONFIG, encoding="utf-8") as f:
+            data = json.load(f)
+        sizes = data.get("sizes", [])
+        valid_sizes = [
+            s for s in sizes
+            if isinstance(s, dict)
+            and isinstance(s.get("name"), str)
+            and isinstance(s.get("width_in"), (int, float))
+            and isinstance(s.get("height_in"), (int, float))
+            and s["width_in"] > 0
+            and s["height_in"] > 0
+        ]
+        if valid_sizes:
+            return valid_sizes
+    except Exception:
+        pass
+    return list(_DEFAULT_PAPER_SIZES)
 
 
 class MainWindow(QMainWindow):
@@ -522,6 +546,7 @@ class MainWindow(QMainWindow):
 
         _apply_transform()
 
+        failures: list[str] = []
         try:
             for i, path in enumerate(self._photo_paths):
                 eff_pw, eff_ph = self._effective_paper_dims(path)
@@ -550,17 +575,22 @@ class MainWindow(QMainWindow):
                 )
                 QApplication.processEvents()
 
-                img = Image.open(path).convert("RGB")
-                fit = self._effective_fit_mode(i)
-                pan = self._photo_pans.get(i, (0.0, 0.0))
-                cropped = render_image(img, print_w_px, print_h_px, fit, pan[0], pan[1])
-                img_bytes = cropped.tobytes("raw", "RGB")
-                qimg = QImage(
-                    img_bytes,
-                    print_w_px, print_h_px,
-                    print_w_px * 3,
-                    QImage.Format.Format_RGB888,
-                ).copy()
+                try:
+                    with Image.open(path) as img:
+                        rgb = img.convert("RGB")
+                    fit = self._effective_fit_mode(i)
+                    pan = self._photo_pans.get(i, (0.0, 0.0))
+                    cropped = render_image(rgb, print_w_px, print_h_px, fit, pan[0], pan[1])
+                    img_bytes = cropped.tobytes("raw", "RGB")
+                    qimg = QImage(
+                        img_bytes,
+                        print_w_px, print_h_px,
+                        print_w_px * 3,
+                        QImage.Format.Format_RGB888,
+                    ).copy()
+                except Exception as exc:
+                    failures.append(f"{Path(path).name}: {exc}")
+                    continue
 
                 painter.drawImage(offset_x, offset_y, qimg)
 
@@ -582,6 +612,14 @@ class MainWindow(QMainWindow):
         finally:
             painter.end()
 
-        self.statusBar().showMessage(
-            f"Done — sent {len(self._photo_paths)} photo(s) to printer."
-        )
+        sent_count = len(self._photo_paths) - len(failures)
+        if failures:
+            preview = "\n".join(failures[:5])
+            extra = "" if len(failures) <= 5 else f"\n...and {len(failures) - 5} more"
+            QMessageBox.warning(
+                self,
+                "Some Photos Failed",
+                f"Sent {sent_count} of {len(self._photo_paths)} photo(s).\n\n"
+                f"Failed files:\n{preview}{extra}",
+            )
+        self.statusBar().showMessage(f"Done: sent {sent_count} photo(s) to printer.")

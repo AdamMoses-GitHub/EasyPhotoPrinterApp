@@ -12,6 +12,8 @@ def _simplify_ratio(w: int, h: int) -> tuple[int, int]:
 
 def _closest_simple_ratio(w: int, h: int) -> str:
     """Return a human-friendly ratio string, e.g. '3:2', '16:9'."""
+    if w <= 0 or h <= 0:
+        return "—"
     rw, rh = _simplify_ratio(w, h)
     # If both sides are small already, done
     if max(rw, rh) <= 20:
@@ -30,12 +32,19 @@ def _closest_simple_ratio(w: int, h: int) -> str:
 def read_photo_info(path: str) -> dict:
     """Read file metadata and PIL image info. Returns a plain dict."""
     p = Path(path)
-    stat = p.stat()
+
+    try:
+        stat = p.stat()
+        modified = datetime.fromtimestamp(stat.st_mtime)
+        file_size = stat.st_size
+    except Exception:
+        modified = None
+        file_size = 0
 
     info: dict = {
         "filename": p.name,
-        "file_size": stat.st_size,
-        "modified": datetime.fromtimestamp(stat.st_mtime),
+        "file_size": file_size,
+        "modified": modified,
         "pixel_w": 0,
         "pixel_h": 0,
         "ratio": "—",
@@ -55,7 +64,7 @@ def read_photo_info(path: str) -> dict:
             # Embedded DPI (may be unreliable for camera JPEGs)
             if hasattr(img, "info") and "dpi" in img.info:
                 dx, dy = img.info["dpi"]
-                if dx > 0:
+                if isinstance(dx, (int, float)) and isinstance(dy, (int, float)) and dx > 0 and dy > 0:
                     info["dpi_x"] = round(dx)
                     info["dpi_y"] = round(dy)
 
