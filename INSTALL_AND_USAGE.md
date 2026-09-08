@@ -150,6 +150,48 @@ pip install ruff
 ruff check .
 ```
 
+### Windows Installer Build
+
+The Windows installer is built on top of the PyInstaller EXE, then wrapped with Inno Setup.
+
+Required tools:
+
+- Python environment with PySide6 and Pillow installed
+- PyInstaller
+- Inno Setup 6 (`ISCC.exe`)
+
+Build commands:
+
+```powershell
+.\build_exe.ps1
+.\build_installer.ps1
+```
+
+To set a release version explicitly:
+
+```powershell
+.\build_installer.ps1 -Version 1.2.3
+```
+
+Installer output:
+
+- `dist\installer\EasyPhotoPrinter-Setup-<version>.exe`
+
+What the installer includes:
+
+- The packaged app executable
+- `README.md`
+- `INSTALL_AND_USAGE.md`
+- `screenshot.jpg`
+
+Install behavior:
+
+- Per-user install under `%LOCALAPPDATA%\Programs\EasyPhotoPrinter`
+- Start Menu shortcut
+- Desktop shortcut
+- Uninstaller entry
+- Upgrade-friendly AppId so newer builds replace older ones cleanly
+
 ## Requirements
 
 Core runtime dependencies currently used by the app:
