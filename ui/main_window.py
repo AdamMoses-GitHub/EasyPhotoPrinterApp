@@ -2,20 +2,20 @@ import json
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QToolBar,
+    QMainWindow, QWidget, QVBoxLayout, QToolBar,
     QComboBox, QLabel, QDoubleSpinBox, QPushButton,
     QFileDialog, QCheckBox, QMessageBox, QStatusBar, QFrame,
-    QDialog, QApplication, QMenu,
+    QDialog, QApplication, QMenu, QToolButton, QWidgetAction, QFormLayout, QSizePolicy,
+    QScrollArea, QSplitter,
 )
 from PySide6.QtCore import Qt, QSettings, QSizeF, QMarginsF
 from PySide6.QtGui import QPainter, QImage, QPageSize, QPageLayout, QTransform, QPen, QColor
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog
-from PIL import Image
 
 from ui.photo_canvas import PhotoCanvas
 from ui.thumbnail_bar import ThumbnailBar
-from core.image_processor import FitMode, render_image
-from core.photo_info import read_photo_info
+from core.image_processor import ColorMode, FitMode, render_color_image
+from core.photo_info import load_oriented_image, oriented_image_size, read_photo_info
 
 _CONFIG = Path(__file__).parent.parent / "config" / "paper_sizes.json"
 _MAX_PRINT_DPI = 600  # cap to keep memory/time reasonable
@@ -60,6 +60,8 @@ class MainWindow(QMainWindow):
         self._current_index: int = -1
         self._photo_overrides: dict[int, str | None] = {}  # index -> FitMode value or None
         self._photo_pans: dict[int, tuple[float, float]] = {}  # index -> (pan_x, pan_y)
+        self._photo_colors: dict[int, ColorMode] = {}
+        self._photo_dithers: dict[int, bool] = {}
         self._paper_sizes = _load_paper_sizes()
         self._settings = QSettings("PrinterApp", "PrinterApp")
 
@@ -80,32 +82,23 @@ class MainWindow(QMainWindow):
         self.addToolBar(self._build_toolbar())
         self._build_menu_bar()
 
+        self._settings_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._settings_splitter.setChildrenCollapsible(False)
+        self._settings_scroll = QScrollArea()
+        self._settings_scroll.setWidgetResizable(True)
+        self._settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._settings_scroll.setMinimumWidth(280)
+        self._settings_scroll.setWidget(self._build_settings_sidebar())
+        self._settings_splitter.addWidget(self._settings_scroll)
         self._canvas = PhotoCanvas()
         self._canvas.pan_changed.connect(self._on_pan_changed)
-        layout.addWidget(self._canvas, stretch=1)
-
-        # Per-photo fit mode override bar
-        override_bar = QWidget()
-        ol = QHBoxLayout(override_bar)
-        ol.setContentsMargins(8, 3, 8, 3)
-        ol.setSpacing(6)
-        ol.addWidget(QLabel("This photo:"))
-        self._photo_fit_combo = QComboBox()
-        self._photo_fit_combo.addItem("Use global setting")
-        for m in FitMode:
-            self._photo_fit_combo.addItem(m.value)
-        self._photo_fit_combo.setEnabled(False)
-        self._photo_fit_combo.currentTextChanged.connect(self._on_photo_fit_changed)
-        ol.addWidget(self._photo_fit_combo)
-
-        self._reset_crop_btn = QPushButton("Reset crop")
-        self._reset_crop_btn.setEnabled(False)
-        self._reset_crop_btn.setToolTip("Re-center the crop (undo manual pan)")
-        self._reset_crop_btn.clicked.connect(self._on_reset_crop)
-        ol.addWidget(self._reset_crop_btn)
-
-        ol.addStretch()
-        layout.addWidget(override_bar)
+        self._settings_splitter.addWidget(self._canvas)
+        self._settings_splitter.setStretchFactor(0, 0)
+        self._settings_splitter.setStretchFactor(1, 1)
+        self._settings_splitter.setSizes([300, 660])
+        self._settings_splitter.splitterMoved.connect(self._save_splitter_state)
+        layout.addWidget(self._settings_splitter, stretch=1)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -117,6 +110,86 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._thumb_bar)
 
         self.setStatusBar(QStatusBar())
+
+    def _build_settings_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
+        heading = QLabel("All photos")
+        font = heading.font()
+        font.setBold(True)
+        heading.setFont(font)
+        layout.addWidget(heading)
+        self._add_settings_section(layout, "Paper", self._build_paper_settings())
+        self._add_settings_section(layout, "Layout", self._build_layout_settings(), expanded=False)
+        self._add_settings_section(layout, "Appearance", self._build_appearance_settings())
+
+        heading = QLabel("Selected photo")
+        heading.setFont(font)
+        layout.addWidget(heading)
+        hint = QLabel("Overrides apply only to the selected thumbnail.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        layout.addWidget(self._build_photo_settings())
+        layout.addStretch()
+        for combo in sidebar.findChildren(QComboBox):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(16)
+            combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        return sidebar
+
+    def _add_settings_section(self, layout: QVBoxLayout, title: str, content: QWidget,
+                              expanded: bool = True):
+        toggle = QToolButton()
+        toggle.setText(title)
+        toggle.setCheckable(True)
+        toggle.setChecked(expanded)
+        toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
+        toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        toggle.toggled.connect(content.setVisible)
+        content.setVisible(expanded)
+        toggle.toggled.connect(
+            lambda checked: toggle.setArrowType(
+                Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+            )
+        )
+        layout.addWidget(toggle)
+        layout.addWidget(content)
+
+    def _build_photo_settings(self) -> QWidget:
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+        self._photo_fit_combo = QComboBox()
+        self._photo_fit_combo.addItem("Use global setting")
+        for m in FitMode:
+            self._photo_fit_combo.addItem(m.value)
+        self._photo_fit_combo.setEnabled(False)
+        self._photo_fit_combo.currentTextChanged.connect(self._on_photo_fit_changed)
+        form.addRow("Fit:", self._photo_fit_combo)
+
+        self._reset_crop_btn = QPushButton("Reset crop")
+        self._reset_crop_btn.setEnabled(False)
+        self._reset_crop_btn.setToolTip("Re-center the crop (undo manual pan)")
+        self._reset_crop_btn.clicked.connect(self._on_reset_crop)
+        self._photo_color_combo = QComboBox()
+        self._photo_color_combo.addItem("Use global setting")
+        for mode in ColorMode:
+            self._photo_color_combo.addItem(mode.value)
+        self._photo_color_combo.setEnabled(False)
+        self._photo_color_combo.currentTextChanged.connect(self._on_photo_color_changed)
+        form.addRow("Color mode:", self._photo_color_combo)
+
+        self._photo_dither_combo = QComboBox()
+        self._photo_dither_combo.addItems(["Global dithering", "Dithering on", "Dithering off"])
+        self._photo_dither_combo.setEnabled(False)
+        self._photo_dither_combo.currentIndexChanged.connect(self._on_photo_dither_changed)
+        form.addRow("Dithering:", self._photo_dither_combo)
+        form.addRow(self._reset_crop_btn)
+        return panel
 
     def _build_menu_bar(self):
         view_menu: QMenu = self.menuBar().addMenu("&View")
@@ -134,6 +207,20 @@ class MainWindow(QMainWindow):
         )
         self._crop_shadow_action.toggled.connect(self._on_crop_shadow_toggled)
 
+        help_menu: QMenu = self.menuBar().addMenu("&Help")
+        self._about_action = help_menu.addAction("&About EasyPhotoPrinter")
+        self._about_action.triggered.connect(self._show_about)
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            "About EasyPhotoPrinter",
+            "<h3>EasyPhotoPrinter</h3>"
+            "<p>Arrange, preview, and batch-print photos at your chosen size.</p>"
+            '<p><a href="https://github.com/AdamMoses-GitHub/EasyPhotoPrinterApp">'
+            "Project website</a></p>",
+        )
+
     def _build_toolbar(self) -> QToolBar:
         tb = QToolBar("Main")
         tb.setMovable(False)
@@ -148,17 +235,28 @@ class MainWindow(QMainWindow):
         self._clear_btn.clicked.connect(self._clear_photos)
         tb.addWidget(self._clear_btn)
 
-        tb.addSeparator()
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
 
-        tb.addWidget(QLabel(" Paper: "))
+        self._print_btn = QPushButton("Print All")
+        self._print_btn.setEnabled(False)
+        self._print_btn.clicked.connect(self._print_all)
+        tb.addWidget(self._print_btn)
+
+        return tb
+
+    def _build_paper_settings(self) -> QWidget:
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self._paper_combo = QComboBox()
-        self._paper_combo.setMinimumWidth(160)
         for s in self._paper_sizes:
             self._paper_combo.addItem(s["name"], s)
         self._paper_combo.currentIndexChanged.connect(self._on_paper_changed)
-        tb.addWidget(self._paper_combo)
+        form.addRow("Paper:", self._paper_combo)
 
-        tb.addWidget(QLabel("  Orientation: "))
         self._orient_combo = QComboBox()
         self._orient_combo.addItems(["Portrait", "Landscape", "Auto"])
         self._orient_combo.setToolTip(
@@ -166,9 +264,14 @@ class MainWindow(QMainWindow):
             "Auto: rotate paper to match each photo's aspect ratio."
         )
         self._orient_combo.currentIndexChanged.connect(self._on_orientation_changed)
-        tb.addWidget(self._orient_combo)
+        form.addRow("Orientation:", self._orient_combo)
+        return panel
 
-        tb.addWidget(QLabel("  Fit: "))
+    def _build_appearance_settings(self) -> QWidget:
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         self._global_fit_combo = QComboBox()
         for m in FitMode:
             self._global_fit_combo.addItem(m.value)
@@ -178,16 +281,38 @@ class MainWindow(QMainWindow):
             "Stretch: distort to fill exactly"
         )
         self._global_fit_combo.currentTextChanged.connect(self._on_global_fit_changed)
-        tb.addWidget(self._global_fit_combo)
+        form.addRow("Fit:", self._global_fit_combo)
 
-        tb.addSeparator()
+        self._global_color_combo = QComboBox()
+        for mode in ColorMode:
+            self._global_color_combo.addItem(mode.value)
+        self._global_color_combo.setToolTip(
+            "Changes preview and print appearance without modifying original files.\n"
+            "Does not control the printer's internal color depth or ink usage."
+        )
+        self._global_color_combo.currentTextChanged.connect(self._on_global_color_changed)
+        form.addRow("Color mode:", self._global_color_combo)
+        self._dither_chk = QCheckBox("Dithering")
+        self._dither_chk.setChecked(True)
+        self._dither_chk.setToolTip(
+            "Use dots to approximate missing tones in indexed color and black & white.\n"
+            "May make photos look grainier. Preview dot patterns vary with output resolution."
+        )
+        self._dither_chk.toggled.connect(self._on_global_color_changed)
+        form.addRow(self._dither_chk)
+        return panel
 
-        self._full_paper_chk = QCheckBox("Full paper")
-        self._full_paper_chk.setChecked(True)
-        self._full_paper_chk.toggled.connect(self._on_full_paper_toggled)
-        tb.addWidget(self._full_paper_chk)
+    def _build_layout_settings(self) -> QWidget:
+        panel = QWidget()
+        form = QFormLayout(panel)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
 
-        tb.addWidget(QLabel("  W: "))
+        self._size_mode_combo = QComboBox()
+        self._size_mode_combo.addItems(["Full paper", "Custom size"])
+        self._size_mode_combo.currentTextChanged.connect(self._on_size_mode_changed)
+        form.addRow("Print size:", self._size_mode_combo)
+
         self._area_w_spin = QDoubleSpinBox()
         self._area_w_spin.setRange(0.5, 50.0)
         self._area_w_spin.setSingleStep(0.5)
@@ -195,9 +320,8 @@ class MainWindow(QMainWindow):
         self._area_w_spin.setSuffix("\"")
         self._area_w_spin.setEnabled(False)
         self._area_w_spin.valueChanged.connect(self._on_print_area_changed)
-        tb.addWidget(self._area_w_spin)
+        form.addRow("Width:", self._area_w_spin)
 
-        tb.addWidget(QLabel("  H: "))
         self._area_h_spin = QDoubleSpinBox()
         self._area_h_spin.setRange(0.5, 50.0)
         self._area_h_spin.setSingleStep(0.5)
@@ -205,24 +329,60 @@ class MainWindow(QMainWindow):
         self._area_h_spin.setSuffix("\"")
         self._area_h_spin.setEnabled(False)
         self._area_h_spin.valueChanged.connect(self._on_print_area_changed)
-        tb.addWidget(self._area_h_spin)
+        form.addRow("Height:", self._area_h_spin)
 
-        tb.addSeparator()
+        self._margin_edges_btn = QToolButton()
+        self._margin_edges_btn.setText("Margins...")
+        self._margin_edges_btn.setToolTip("Configure margins inside the selected print size")
+        self._margin_edges_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._margin_edges_menu = QMenu(self)
+        margins_panel = QWidget(self._margin_edges_menu)
+        margins_layout = QFormLayout(margins_panel)
+        self._margin_chk = QCheckBox("Add margins")
+        self._margin_chk.toggled.connect(self._on_margin_toggled)
+        margins_layout.addRow(self._margin_chk)
+        self._margin_mode_combo = QComboBox()
+        self._margin_mode_combo.addItems(["Inches", "Percent"])
+        self._margin_mode_combo.setToolTip("Set margins in physical inches or as a percentage of the print area")
+        self._margin_mode_combo.setEnabled(False)
+        self._margin_mode_combo.currentTextChanged.connect(self._on_margin_mode_changed)
+        margins_layout.addRow("Unit:", self._margin_mode_combo)
+        self._margin_spin = QDoubleSpinBox()
+        self._margin_spin.setRange(0.0, 10.0)
+        self._margin_spin.setSingleStep(0.125)
+        self._margin_spin.setDecimals(3)
+        self._margin_spin.setSuffix('"')
+        self._margin_spin.setValue(0.25)
+        self._margin_spin.setEnabled(False)
+        self._margin_spin.valueChanged.connect(self._on_margin_changed)
+        margins_layout.addRow("All sides:", self._margin_spin)
+        self._separate_margins_chk = QCheckBox("Set edges separately")
+        self._separate_margins_chk.toggled.connect(self._on_separate_margins_toggled)
+        margins_layout.addRow(self._separate_margins_chk)
+        self._margin_edge_spins: dict[str, QDoubleSpinBox] = {}
+        for edge in ("Top", "Right", "Bottom", "Left"):
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 10.0)
+            spin.setSingleStep(0.125)
+            spin.setDecimals(3)
+            spin.setSuffix('"')
+            spin.setValue(0.25)
+            spin.setEnabled(False)
+            spin.valueChanged.connect(self._on_margin_changed)
+            self._margin_edge_spins[edge.lower()] = spin
+            margins_layout.addRow(f"{edge}:", spin)
+        margins_action = QWidgetAction(self._margin_edges_menu)
+        margins_action.setDefaultWidget(margins_panel)
+        self._margin_edges_menu.addAction(margins_action)
+        self._margin_edges_btn.setMenu(self._margin_edges_menu)
+        form.addRow(self._margin_edges_btn)
 
         self._cut_markers_chk = QCheckBox("Cut markers")
-        self._cut_markers_chk.setChecked(False)
-        self._cut_markers_chk.setEnabled(False)  # only active in custom-area mode
+        self._cut_markers_chk.setEnabled(False)
         self._cut_markers_chk.toggled.connect(self._on_cut_markers_toggled)
-        tb.addWidget(self._cut_markers_chk)
+        form.addRow(self._cut_markers_chk)
 
-        tb.addSeparator()
-
-        self._print_btn = QPushButton("Print All")
-        self._print_btn.setEnabled(False)
-        self._print_btn.clicked.connect(self._print_all)
-        tb.addWidget(self._print_btn)
-
-        return tb
+        return panel
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -235,11 +395,32 @@ class MainWindow(QMainWindow):
         full = self._settings.value("full_paper", True, type=bool)
         area_w = float(self._settings.value("area_w", 4.0))
         area_h = float(self._settings.value("area_h", 6.0))
+        margin_enabled = self._settings.value("margin_enabled", False, type=bool)
+        margin_in = float(self._settings.value("margin_in", 0.25))
+        margin_mode = self._settings.value("margin_mode", "Inches")
+        separate_margins = self._settings.value("separate_margins", False, type=bool)
+        margin_top = float(self._settings.value("margin_top", margin_in))
+        margin_right = float(self._settings.value("margin_right", margin_in))
+        margin_bottom = float(self._settings.value("margin_bottom", margin_in))
+        margin_left = float(self._settings.value("margin_left", margin_in))
         cut_markers = self._settings.value("cut_markers", False, type=bool)
         orient = self._settings.value("orientation", "Auto")
         global_fit = self._settings.value("global_fit", FitMode.FILL.value)
         crop_shadow = self._settings.value("crop_shadow", True, type=bool)
         paper_shadow = self._settings.value("paper_shadow", True, type=bool)
+        global_color = str(self._settings.value("global_color", ColorMode.FULL.value))
+        dither = bool(self._settings.value("dither", True, type=bool))
+        splitter_state = self._settings.value("settings_splitter_state")
+        if splitter_state is not None:
+            self._settings_splitter.restoreState(splitter_state)
+
+        self._global_color_combo.blockSignals(True)
+        idx = self._global_color_combo.findText(global_color)
+        self._global_color_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._global_color_combo.blockSignals(False)
+        self._dither_chk.blockSignals(True)
+        self._dither_chk.setChecked(dither)
+        self._dither_chk.blockSignals(False)
 
         self._paper_shadow_chk.blockSignals(True)
         self._paper_shadow_chk.setChecked(paper_shadow)
@@ -263,9 +444,9 @@ class MainWindow(QMainWindow):
         self._paper_combo.setCurrentIndex(paper_idx)
         self._paper_combo.blockSignals(False)
 
-        self._full_paper_chk.blockSignals(True)
-        self._full_paper_chk.setChecked(full)
-        self._full_paper_chk.blockSignals(False)
+        self._size_mode_combo.blockSignals(True)
+        self._size_mode_combo.setCurrentText("Full paper" if full else "Custom size")
+        self._size_mode_combo.blockSignals(False)
         self._area_w_spin.setEnabled(not full)
         self._area_h_spin.setEnabled(not full)
         self._cut_markers_chk.setEnabled(not full)
@@ -278,6 +459,35 @@ class MainWindow(QMainWindow):
         self._area_h_spin.setValue(area_h)
         self._area_h_spin.blockSignals(False)
 
+        self._margin_chk.blockSignals(True)
+        self._margin_chk.setChecked(margin_enabled)
+        self._margin_chk.blockSignals(False)
+
+        self._margin_mode_combo.blockSignals(True)
+        mode_idx = self._margin_mode_combo.findText(margin_mode)
+        self._margin_mode_combo.setCurrentIndex(mode_idx if mode_idx >= 0 else 0)
+        self._margin_mode_combo.blockSignals(False)
+
+        self._margin_spin.blockSignals(True)
+        self._margin_spin.setValue(margin_in)
+        self._margin_spin.blockSignals(False)
+
+        self._separate_margins_chk.blockSignals(True)
+        self._separate_margins_chk.setChecked(separate_margins)
+        self._separate_margins_chk.blockSignals(False)
+        for edge, value in {
+            "top": margin_top,
+            "right": margin_right,
+            "bottom": margin_bottom,
+            "left": margin_left,
+        }.items():
+            spin = self._margin_edge_spins[edge]
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+        self._configure_margin_spinboxes()
+        self._update_margin_controls()
+
         self._cut_markers_chk.blockSignals(True)
         self._cut_markers_chk.setChecked(cut_markers)
         self._cut_markers_chk.blockSignals(False)
@@ -285,13 +495,29 @@ class MainWindow(QMainWindow):
         self._update_canvas_settings()
 
     def _save_settings(self):
+        self._settings.setValue(
+            "settings_splitter_state", self._settings_splitter.saveState(),
+        )
         self._settings.setValue("paper_index", self._paper_combo.currentIndex())
-        self._settings.setValue("full_paper", self._full_paper_chk.isChecked())
+        self._settings.setValue("full_paper", self._is_full_paper())
         self._settings.setValue("area_w", self._area_w_spin.value())
         self._settings.setValue("area_h", self._area_h_spin.value())
+        self._settings.setValue("margin_enabled", self._margin_chk.isChecked())
+        self._settings.setValue("margin_in", self._margin_spin.value())
+        self._settings.setValue("margin_mode", self._margin_mode_combo.currentText())
+        self._settings.setValue("separate_margins", self._separate_margins_chk.isChecked())
+        for edge, spin in self._margin_edge_spins.items():
+            self._settings.setValue(f"margin_{edge}", spin.value())
         self._settings.setValue("cut_markers", self._cut_markers_chk.isChecked())
         self._settings.setValue("orientation", self._orient_combo.currentText())
         self._settings.setValue("global_fit", self._global_fit_combo.currentText())
+        self._settings.setValue("global_color", self._global_color_combo.currentText())
+        self._settings.setValue("dither", self._dither_chk.isChecked())
+
+    def _save_splitter_state(self, _position: int, _index: int):
+        self._settings.setValue(
+            "settings_splitter_state", self._settings_splitter.saveState(),
+        )
 
     # ------------------------------------------------------------------
     # Slot handlers
@@ -309,6 +535,8 @@ class MainWindow(QMainWindow):
         self._photo_paths = paths
         self._photo_overrides.clear()
         self._photo_pans.clear()
+        self._photo_colors.clear()
+        self._photo_dithers.clear()
         self._thumb_bar.set_photos(paths)
         self._print_btn.setEnabled(True)
         self._clear_btn.setEnabled(True)
@@ -319,6 +547,8 @@ class MainWindow(QMainWindow):
         self._current_index = -1
         self._photo_overrides.clear()
         self._photo_pans.clear()
+        self._photo_colors.clear()
+        self._photo_dithers.clear()
         self._thumb_bar.set_photos([])
         self._canvas.clear_photo()
         self._canvas.set_photo_info(None)
@@ -326,6 +556,11 @@ class MainWindow(QMainWindow):
         self._photo_fit_combo.setCurrentIndex(0)
         self._photo_fit_combo.blockSignals(False)
         self._photo_fit_combo.setEnabled(False)
+        for combo in (self._photo_color_combo, self._photo_dither_combo):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            combo.setEnabled(False)
         self._reset_crop_btn.setEnabled(False)
         self._print_btn.setEnabled(False)
         self._clear_btn.setEnabled(False)
@@ -333,7 +568,11 @@ class MainWindow(QMainWindow):
 
     def _on_photo_selected(self, index: int, path: str):
         self._current_index = index
-        self._canvas.set_photo(path)
+        try:
+            self._canvas.set_photo(path)
+        except (OSError, ValueError) as exc:
+            self._canvas.clear_photo()
+            QMessageBox.warning(self, "Preview Error", f"Cannot preview {Path(path).name}:\n{exc}")
         self._canvas.set_photo_info(read_photo_info(path))
         # Restore per-photo override in the combo without triggering a write-back
         override = self._photo_overrides.get(index)
@@ -341,6 +580,15 @@ class MainWindow(QMainWindow):
         self._photo_fit_combo.setCurrentText(override if override else "Use global setting")
         self._photo_fit_combo.blockSignals(False)
         self._photo_fit_combo.setEnabled(True)
+        color = self._photo_colors.get(index)
+        self._photo_color_combo.blockSignals(True)
+        self._photo_color_combo.setCurrentText(color.value if color else "Use global setting")
+        self._photo_color_combo.blockSignals(False)
+        self._photo_color_combo.setEnabled(True)
+        dither = self._photo_dithers.get(index)
+        self._photo_dither_combo.blockSignals(True)
+        self._photo_dither_combo.setCurrentIndex(0 if dither is None else (1 if dither else 2))
+        self._photo_dither_combo.blockSignals(False)
         # Restore pan
         pan = self._photo_pans.get(index, (0.0, 0.0))
         self._canvas.set_pan(pan[0], pan[1])
@@ -380,6 +628,34 @@ class MainWindow(QMainWindow):
             self._photo_overrides[self._current_index] = text
         self._update_canvas_settings()
 
+    def _on_global_color_changed(self):
+        self._update_canvas_settings()
+        self._save_settings()
+
+    def _on_photo_color_changed(self, text: str):
+        if self._current_index < 0:
+            return
+        if text == "Use global setting":
+            self._photo_colors.pop(self._current_index, None)
+        else:
+            self._photo_colors[self._current_index] = ColorMode(text)
+        self._update_canvas_settings()
+
+    def _on_photo_dither_changed(self, index: int):
+        if self._current_index < 0:
+            return
+        if index == 0:
+            self._photo_dithers.pop(self._current_index, None)
+        else:
+            self._photo_dithers[self._current_index] = index == 1
+        self._update_canvas_settings()
+
+    def _effective_color_mode(self, index: int) -> ColorMode:
+        return self._photo_colors.get(index, ColorMode(self._global_color_combo.currentText()))
+
+    def _effective_dither(self, index: int) -> bool:
+        return self._photo_dithers.get(index, self._dither_chk.isChecked())
+
     def _on_crop_shadow_toggled(self, checked: bool):
         self._canvas.set_crop_shadow(checked)
         self._settings.setValue("crop_shadow", checked)
@@ -396,11 +672,12 @@ class MainWindow(QMainWindow):
         self._canvas.set_cut_markers(checked)
         self._save_settings()
 
-    def _on_full_paper_toggled(self, checked: bool):
-        self._area_w_spin.setEnabled(not checked)
-        self._area_h_spin.setEnabled(not checked)
-        self._cut_markers_chk.setEnabled(not checked)
-        if checked:
+    def _on_size_mode_changed(self):
+        full_paper = self._is_full_paper()
+        self._area_w_spin.setEnabled(not full_paper)
+        self._area_h_spin.setEnabled(not full_paper)
+        self._cut_markers_chk.setEnabled(not full_paper)
+        if full_paper:
             self._cut_markers_chk.setChecked(False)
             paper = self._current_paper()
             if paper:
@@ -414,9 +691,51 @@ class MainWindow(QMainWindow):
         self._save_settings()
 
     def _on_print_area_changed(self):
-        if not self._full_paper_chk.isChecked():
+        if not self._is_full_paper():
             self._update_canvas_settings()
             self._save_settings()
+
+    def _on_margin_toggled(self, checked: bool):
+        self._update_margin_controls()
+        self._update_canvas_settings()
+        self._save_settings()
+
+    def _on_margin_mode_changed(self):
+        self._configure_margin_spinboxes()
+        self._update_canvas_settings()
+        self._save_settings()
+
+    def _on_separate_margins_toggled(self):
+        self._update_margin_controls()
+        self._update_canvas_settings()
+        self._save_settings()
+
+    def _on_margin_changed(self):
+        if self._margin_chk.isChecked():
+            self._update_canvas_settings()
+            self._save_settings()
+
+    def _configure_margin_spinboxes(self):
+        is_percent = self._margin_mode_combo.currentText() == "Percent"
+        maximum = 99.0 if is_percent else 10.0
+        step = 0.5 if is_percent else 0.125
+        decimals = 1 if is_percent else 3
+        suffix = "%" if is_percent else '"'
+        for spin in [self._margin_spin, *self._margin_edge_spins.values()]:
+            spin.setRange(0.0, maximum)
+            spin.setSingleStep(step)
+            spin.setDecimals(decimals)
+            spin.setSuffix(suffix)
+
+    def _update_margin_controls(self):
+        enabled = self._margin_chk.isChecked()
+        separate = self._separate_margins_chk.isChecked()
+        self._margin_mode_combo.setEnabled(enabled)
+        self._margin_spin.setEnabled(enabled and not separate)
+        self._margin_edges_btn.setEnabled(True)
+        self._margin_edges_btn.setText("Margins..." if not enabled else "Margins: on")
+        for spin in self._margin_edge_spins.values():
+            spin.setEnabled(enabled and separate)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -424,6 +743,9 @@ class MainWindow(QMainWindow):
 
     def _current_paper(self) -> dict | None:
         return self._paper_combo.currentData()
+
+    def _is_full_paper(self) -> bool:
+        return self._size_mode_combo.currentText() == "Full paper"
 
     def _effective_paper_dims(self, photo_path: str | None = None) -> tuple[float, float]:
         """Return (width_in, height_in) after applying orientation setting."""
@@ -447,10 +769,8 @@ class MainWindow(QMainWindow):
                 iw, ih = info.get("pixel_w", 0), info.get("pixel_h", 0)
             else:
                 try:
-                    img = Image.open(photo_path)
-                    iw, ih = img.size
-                    img.close()
-                except Exception:
+                    iw, ih = oriented_image_size(photo_path)
+                except (OSError, ValueError):
                     iw, ih = 0, 0
             if iw > ih and pw < ph:
                 pw, ph = ph, pw
@@ -471,26 +791,65 @@ class MainWindow(QMainWindow):
 
     def _get_print_area_inches(self, photo_path: str | None = None) -> tuple[float, float]:
         pw, ph = self._effective_paper_dims(photo_path)
-        if self._full_paper_chk.isChecked():
+        if self._is_full_paper():
             return pw, ph
         return min(self._area_w_spin.value(), pw), min(self._area_h_spin.value(), ph)
+
+    def _get_margins_inches(self, print_w_in: float, print_h_in: float) -> tuple[float, float, float, float]:
+        if not self._margin_chk.isChecked():
+            return 0.0, 0.0, 0.0, 0.0
+        if self._separate_margins_chk.isChecked():
+            top = self._margin_edge_spins["top"].value()
+            right = self._margin_edge_spins["right"].value()
+            bottom = self._margin_edge_spins["bottom"].value()
+            left = self._margin_edge_spins["left"].value()
+        else:
+            top = right = bottom = left = self._margin_spin.value()
+
+        if self._margin_mode_combo.currentText() == "Percent":
+            top = print_h_in * top / 100
+            bottom = print_h_in * bottom / 100
+            right = print_w_in * right / 100
+            left = print_w_in * left / 100
+
+        def clamp_pair(first: float, second: float, dimension: float) -> tuple[float, float]:
+            maximum_total = max(0.0, dimension - 0.01)
+            total = first + second
+            if total <= maximum_total or total == 0:
+                return first, second
+            scale = maximum_total / total
+            return first * scale, second * scale
+
+        left, right = clamp_pair(left, right, print_w_in)
+        top, bottom = clamp_pair(top, bottom, print_h_in)
+        return top, right, bottom, left
 
     def _update_canvas_settings(self):
         photo_path = self._current_photo_path()
         pw, ph = self._effective_paper_dims(photo_path)
         self._canvas.set_paper(pw, ph)
 
-        if self._full_paper_chk.isChecked():
+        if self._is_full_paper():
             self._canvas.set_print_area(pw, ph)
             self._canvas.set_cut_markers(False)
+            self._canvas.set_margins(*self._get_margins_inches(pw, ph))
         else:
             aw = min(self._area_w_spin.value(), pw)
             ah = min(self._area_h_spin.value(), ph)
             self._canvas.set_print_area(aw, ah)
             self._canvas.set_cut_markers(self._cut_markers_chk.isChecked())
+            self._canvas.set_margins(*self._get_margins_inches(aw, ah))
         self._canvas.set_fit_mode(self._effective_fit_mode(self._current_index))
         self._canvas.set_crop_shadow(self._crop_shadow_action.isChecked())
         self._canvas.set_paper_shadow(self._paper_shadow_chk.isChecked())
+        self._dither_chk.setEnabled(
+            ColorMode(self._global_color_combo.currentText()).supports_dithering
+        )
+        color = self._effective_color_mode(self._current_index)
+        self._photo_dither_combo.setEnabled(
+            self._current_index >= 0 and color.supports_dithering
+        )
+        self._canvas.set_color_mode(color, self._effective_dither(self._current_index))
 
     # ------------------------------------------------------------------
     # Printing
@@ -547,6 +906,7 @@ class MainWindow(QMainWindow):
         _apply_transform()
 
         failures: list[str] = []
+        page_started = False
         try:
             for i, path in enumerate(self._photo_paths):
                 eff_pw, eff_ph = self._effective_paper_dims(path)
@@ -555,20 +915,24 @@ class MainWindow(QMainWindow):
                     if eff_pw > eff_ph
                     else QPageLayout.Orientation.Portrait
                 )
-                if i > 0:
-                    # setPageLayout resets full-page; re-assert before newPage
-                    printer.setPageLayout(QPageLayout(page_size, orient, QMarginsF(0, 0, 0, 0)))
-                    printer.setFullPage(True)
-                    printer.newPage()
-                    _apply_transform()  # newPage resets painter transform
-
                 print_w_in, print_h_in = self._get_print_area_inches(path)
+                top_in, right_in, bottom_in, left_in = self._get_margins_inches(
+                    print_w_in, print_h_in,
+                )
                 print_w_px = int(print_w_in * dpi)
                 print_h_px = int(print_h_in * dpi)
+                top_px = int(top_in * dpi)
+                right_px = int(right_in * dpi)
+                bottom_px = int(bottom_in * dpi)
+                left_px = int(left_in * dpi)
+                image_w_px = max(1, print_w_px - left_px - right_px)
+                image_h_px = max(1, print_h_px - top_px - bottom_px)
                 paper_w_px = int(eff_pw * dpi)
                 paper_h_px = int(eff_ph * dpi)
                 offset_x = (paper_w_px - print_w_px) // 2
                 offset_y = (paper_h_px - print_h_px) // 2
+                image_offset_x = offset_x + left_px
+                image_offset_y = offset_y + top_px
 
                 self.statusBar().showMessage(
                     f"Printing {i + 1} / {len(self._photo_paths)}: {Path(path).name}…"
@@ -576,23 +940,40 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
 
                 try:
-                    with Image.open(path) as img:
-                        rgb = img.convert("RGB")
+                    rgb = load_oriented_image(path).convert("RGB")
                     fit = self._effective_fit_mode(i)
                     pan = self._photo_pans.get(i, (0.0, 0.0))
-                    cropped = render_image(rgb, print_w_px, print_h_px, fit, pan[0], pan[1])
+                    cropped = render_color_image(
+                        rgb, image_w_px, image_h_px, fit, pan[0], pan[1],
+                        self._effective_color_mode(i), self._effective_dither(i),
+                    )
                     img_bytes = cropped.tobytes("raw", "RGB")
                     qimg = QImage(
                         img_bytes,
-                        print_w_px, print_h_px,
-                        print_w_px * 3,
+                        image_w_px, image_h_px,
+                        image_w_px * 3,
                         QImage.Format.Format_RGB888,
                     ).copy()
                 except Exception as exc:
                     failures.append(f"{Path(path).name}: {exc}")
                     continue
 
-                painter.drawImage(offset_x, offset_y, qimg)
+                if page_started:
+                    # setPageLayout resets full-page; re-assert before newPage.
+                    printer.setPageLayout(QPageLayout(page_size, orient, QMarginsF(0, 0, 0, 0)))
+                    printer.setFullPage(True)
+                    if not printer.newPage():
+                        failures.append(f"{Path(path).name}: failed to start a new page.")
+                        continue
+                    _apply_transform()  # newPage resets painter transform
+                elif i > 0:
+                    # The first photo failed, so orient this first printed page.
+                    printer.setPageLayout(QPageLayout(page_size, orient, QMarginsF(0, 0, 0, 0)))
+                    printer.setFullPage(True)
+                    _apply_transform()
+                page_started = True
+
+                painter.drawImage(image_offset_x, image_offset_y, qimg)
 
                 # Cut markers
                 if self._cut_markers_chk.isEnabled() and self._cut_markers_chk.isChecked():

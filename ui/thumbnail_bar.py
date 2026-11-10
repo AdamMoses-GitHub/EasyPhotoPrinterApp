@@ -1,28 +1,71 @@
+from PIL import Image, ImageOps
 from PySide6.QtWidgets import QScrollArea, QWidget, QHBoxLayout, QLabel, QFrame
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, Signal, QObject, QRunnable, QThreadPool
+from PySide6.QtGui import QImage, QPixmap
 
 THUMB_SIZE = 80
 THUMB_BORDER = 2
 ITEM_SIZE = THUMB_SIZE + THUMB_BORDER * 2 + 4  # padding
 
 
+class _ThumbnailSignals(QObject):
+    loaded = Signal(int, int, str, object, str)
+
+
+class _ThumbnailLoader(QRunnable):
+    def __init__(self, generation: int, index: int, path: str):
+        super().__init__()
+        self._generation = generation
+        self._index = index
+        self._path = path
+        self.signals = _ThumbnailSignals()
+
+    def run(self):
+        try:
+            with Image.open(self._path) as source:
+                source.thumbnail(
+                    (THUMB_SIZE, THUMB_SIZE), Image.Resampling.LANCZOS,
+                )
+                image = ImageOps.exif_transpose(source).convert("RGB")
+            thumbnail = (image.width, image.height, image.tobytes())
+            error = ""
+        except Exception as exc:
+            thumbnail = None
+            error = str(exc)
+        self.signals.loaded.emit(
+            self._generation, self._index, self._path, thumbnail, error,
+        )
+
+
 class _ThumbnailItem(QLabel):
     clicked = Signal(int)
 
-    def __init__(self, index: int, path: str, parent=None):
+    def __init__(self, index: int, parent=None):
         super().__init__(parent)
         self._index = index
         self.setFixedSize(ITEM_SIZE, ITEM_SIZE)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        pix = QPixmap(path).scaled(
+        self.setText("Loading...")
+        self._set_style(False)
+
+    def set_thumbnail(self, data: tuple[int, int, bytes] | None, error: str):
+        if data is None:
+            self.setText("!")
+            self.setToolTip(f"Cannot load thumbnail: {error}")
+            return
+        width, height, pixels = data
+        image = QImage(
+            pixels, width, height, width * 3, QImage.Format.Format_RGB888,
+        ).copy()
+        pixmap = QPixmap.fromImage(image).scaled(
             THUMB_SIZE, THUMB_SIZE,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self.setPixmap(pix)
-        self._set_style(False)
+        self.setText("")
+        self.setToolTip("")
+        self.setPixmap(pixmap)
 
     def set_selected(self, selected: bool):
         self._set_style(selected)
@@ -45,6 +88,7 @@ class ThumbnailBar(QScrollArea):
     """Horizontal scrollable strip of photo thumbnails."""
 
     photo_selected = Signal(int, str)  # (index, path)
+    thumbnails_ready = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -64,8 +108,13 @@ class ThumbnailBar(QScrollArea):
         self._items: list[_ThumbnailItem] = []
         self._paths: list[str] = []
         self._selected_index: int = -1
+        self._generation = 0
+        self._completed = 0
 
     def set_photos(self, paths: list[str]):
+        self._generation += 1
+        generation = self._generation
+        self._completed = 0
         for item in self._items:
             self._layout.removeWidget(item)
             item.deleteLater()
@@ -74,13 +123,31 @@ class ThumbnailBar(QScrollArea):
         self._selected_index = -1
 
         for i, path in enumerate(paths):
-            item = _ThumbnailItem(i, path)
+            item = _ThumbnailItem(i)
             item.clicked.connect(self._on_item_clicked)
             self._layout.insertWidget(self._layout.count() - 1, item)
             self._items.append(item)
+            loader = _ThumbnailLoader(generation, i, path)
+            loader.signals.loaded.connect(self._on_thumbnail_loaded)
+            QThreadPool.globalInstance().start(loader)
 
         if self._items:
             self._select(0)
+
+    def _on_thumbnail_loaded(
+        self, generation: int, index: int, path: str,
+        data: tuple[int, int, bytes] | None, error: str,
+    ):
+        if (
+            generation != self._generation
+            or not 0 <= index < len(self._items)
+            or self._paths[index] != path
+        ):
+            return
+        self._items[index].set_thumbnail(data, error)
+        self._completed += 1
+        if self._completed == len(self._items):
+            self.thumbnails_ready.emit()
 
     def _on_item_clicked(self, index: int):
         self._select(index)

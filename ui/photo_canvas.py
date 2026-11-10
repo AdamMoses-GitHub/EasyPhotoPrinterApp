@@ -1,8 +1,10 @@
 from PySide6.QtWidgets import QWidget
 from PySide6.QtCore import Qt, QRect, QRectF, QPoint, Signal
 from PySide6.QtGui import QPainter, QColor, QPixmap, QPen, QFont, QFontMetrics, QCursor
-from core.image_processor import FitMode
-from core.photo_info import print_ppi, ppi_quality
+from PIL import Image
+from PIL.ImageQt import ImageQt
+from core.image_processor import ColorMode, FitMode, render_color_image
+from core.photo_info import load_oriented_image, print_ppi, ppi_quality
 
 
 class PhotoCanvas(QWidget):
@@ -17,10 +19,16 @@ class PhotoCanvas(QWidget):
 
         self._photo_path: str | None = None
         self._pixmap: QPixmap | None = None
+        self._source: Image.Image | None = None
+        self._color_mode = ColorMode.FULL
+        self._dither = True
+        self._preview_key: tuple[int, int, FitMode, float, float, ColorMode, bool] | None = None
+        self._preview: QPixmap | None = None
         self._paper_w_in: float = 4.0
         self._paper_h_in: float = 6.0
         self._print_w_in: float = 4.0
         self._print_h_in: float = 6.0
+        self._margins_in: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self._cut_markers: bool = False
         self._fit_mode: FitMode = FitMode.FILL
         self._crop_shadow: bool = False
@@ -37,13 +45,20 @@ class PhotoCanvas(QWidget):
         self._print_rect_screen: QRect = QRect()
 
     def set_photo(self, path: str):
+        source = load_oriented_image(path).convert("RGB")
         self._photo_path = path
-        self._pixmap = QPixmap(path)
+        self._source = source
+        self._pixmap = QPixmap.fromImage(ImageQt(source))
+        self._preview_key = None
+        self._preview = None
         self.update()
 
     def clear_photo(self):
         self._photo_path = None
         self._pixmap = None
+        self._source = None
+        self._preview_key = None
+        self._preview = None
         self._photo_info = None
         self.update()
 
@@ -57,6 +72,12 @@ class PhotoCanvas(QWidget):
         self._print_h_in = min(print_h_in, self._paper_h_in)
         self.update()
 
+    def set_margins(self, top_in: float, right_in: float, bottom_in: float, left_in: float):
+        self._margins_in = tuple(max(0.0, margin) for margin in (
+            top_in, right_in, bottom_in, left_in,
+        ))
+        self.update()
+
     def set_cut_markers(self, enabled: bool):
         self._cut_markers = enabled
         self.update()
@@ -64,6 +85,25 @@ class PhotoCanvas(QWidget):
     def set_fit_mode(self, mode: FitMode):
         self._fit_mode = mode
         self.update()
+
+    def set_color_mode(self, mode: ColorMode, dither: bool):
+        self._color_mode = mode
+        self._dither = dither
+        self.update()
+
+    def _render_preview(self, width: int, height: int) -> QPixmap:
+        if self._source is None:
+            raise ValueError("No photo loaded")
+        key = (width, height, self._fit_mode, self._pan_x, self._pan_y,
+               self._color_mode, self._dither)
+        if key != self._preview_key or self._preview is None:
+            rendered = render_color_image(
+                self._source, width, height, self._fit_mode, self._pan_x, self._pan_y,
+                self._color_mode, self._dither,
+            )
+            self._preview = QPixmap.fromImage(ImageQt(rendered))
+            self._preview_key = key
+        return self._preview
 
     def set_crop_shadow(self, enabled: bool):
         self._crop_shadow = enabled
@@ -120,25 +160,34 @@ class PhotoCanvas(QWidget):
         print_h_px = int(self._print_h_in * scale_px_per_in)
         print_x = paper_x + (paper_w_px - print_w_px) // 2
         print_y = paper_y + (paper_h_px - print_h_px) // 2
-        self._print_rect_screen = QRect(print_x, print_y, print_w_px, print_h_px)
+        top_in, right_in, bottom_in, left_in = self._margins_in
+        top_px = int(top_in * scale_px_per_in)
+        right_px = int(right_in * scale_px_per_in)
+        bottom_px = int(bottom_in * scale_px_per_in)
+        left_px = int(left_in * scale_px_per_in)
+        image_x = print_x + left_px
+        image_y = print_y + top_px
+        image_w_px = max(1, print_w_px - left_px - right_px)
+        image_h_px = max(1, print_h_px - top_px - bottom_px)
+        self._print_rect_screen = QRect(image_x, image_y, image_w_px, image_h_px)
 
         # --- Draw crop-shadow overflow first (behind paper) ---
         _SHADOW_COLOR = QColor(30, 100, 220, 170)   # blue tint
         if show_cs and self._pixmap and not self._pixmap.isNull():
             scaled_cs = self._pixmap.scaled(
-                print_w_px, print_h_px,
+                image_w_px, image_h_px,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            total_x_off = scaled_cs.width() - print_w_px
-            total_y_off = scaled_cs.height() - print_h_px
+            total_x_off = scaled_cs.width() - image_w_px
+            total_y_off = scaled_cs.height() - image_h_px
             x_off = total_x_off // 2 + round(self._pan_x * (total_x_off / 2))
             y_off = total_y_off // 2 + round(self._pan_y * (total_y_off / 2))
             x_off = max(0, min(x_off, total_x_off))
             y_off = max(0, min(y_off, total_y_off))
             if total_x_off > 0 or total_y_off > 0:
-                draw_x = print_x - x_off
-                draw_y = print_y - y_off
+                draw_x = image_x - x_off
+                draw_y = image_y - y_off
                 painter.drawPixmap(draw_x, draw_y, scaled_cs)
                 painter.fillRect(draw_x, draw_y, scaled_cs.width(), scaled_cs.height(),
                                   _SHADOW_COLOR)
@@ -162,12 +211,12 @@ class PhotoCanvas(QWidget):
         if self._pixmap and not self._pixmap.isNull():
             if self._fit_mode == FitMode.FILL:
                 scaled = self._pixmap.scaled(
-                    print_w_px, print_h_px,
+                    image_w_px, image_h_px,
                     Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                     Qt.TransformationMode.SmoothTransformation,
                 )
-                total_x_off = scaled.width() - print_w_px
-                total_y_off = scaled.height() - print_h_px
+                total_x_off = scaled.width() - image_w_px
+                total_y_off = scaled.height() - image_h_px
                 x_off = total_x_off // 2 + round(self._pan_x * (total_x_off / 2))
                 y_off = total_y_off // 2 + round(self._pan_y * (total_y_off / 2))
                 x_off = max(0, min(x_off, total_x_off))
@@ -179,9 +228,9 @@ class PhotoCanvas(QWidget):
                     # (for the strips between print area and paper edge in custom-area mode).
                     painter.save()
                     painter.setClipRect(paper_x, paper_y, paper_w_px, paper_h_px)
-                    painter.drawPixmap(print_x - x_off, print_y - y_off, scaled)
+                    painter.drawPixmap(image_x - x_off, image_y - y_off, scaled)
                     painter.restore()
-                    # Blue overlay on the in-paper strips outside the print area
+                    # Blue overlay on the in-paper strips outside the image area
                     if print_y > paper_y:
                         painter.fillRect(paper_x, paper_y, paper_w_px, print_y - paper_y, _SHADOW_COLOR)
                     bottom_start = print_y + print_h_px
@@ -194,40 +243,28 @@ class PhotoCanvas(QWidget):
                     if right_start < paper_x + paper_w_px:
                         painter.fillRect(right_start, print_y,
                                          (paper_x + paper_w_px) - right_start, print_h_px, _SHADOW_COLOR)
-                    # Bright print area on top
-                    painter.drawPixmap(
-                        QRect(print_x, print_y, print_w_px, print_h_px),
-                        scaled,
-                        QRect(x_off, y_off, print_w_px, print_h_px),
-                    )
-                else:
-                    painter.drawPixmap(
-                        QRect(print_x, print_y, print_w_px, print_h_px),
-                        scaled,
-                        QRect(x_off, y_off, print_w_px, print_h_px),
-                    )
-            elif self._fit_mode == FitMode.FIT:
-                painter.fillRect(print_x, print_y, print_w_px, print_h_px, Qt.GlobalColor.white)
-                scaled = self._pixmap.scaled(
-                    print_w_px, print_h_px,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                x_off = (print_w_px - scaled.width()) // 2
-                y_off = (print_h_px - scaled.height()) // 2
-                painter.drawPixmap(print_x + x_off, print_y + y_off, scaled)
-            else:  # STRETCH
-                scaled = self._pixmap.scaled(
-                    print_w_px, print_h_px,
-                    Qt.AspectRatioMode.IgnoreAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                painter.drawPixmap(print_x, print_y, scaled)
+                    if image_y > print_y:
+                        painter.fillRect(print_x, print_y, print_w_px, image_y - print_y, _SHADOW_COLOR)
+                    image_bottom = image_y + image_h_px
+                    print_bottom = print_y + print_h_px
+                    if image_bottom < print_bottom:
+                        painter.fillRect(print_x, image_bottom, print_w_px,
+                                         print_bottom - image_bottom, _SHADOW_COLOR)
+                    if image_x > print_x:
+                        painter.fillRect(print_x, image_y, image_x - print_x, image_h_px, _SHADOW_COLOR)
+                    image_right = image_x + image_w_px
+                    print_right = print_x + print_w_px
+                    if image_right < print_right:
+                        painter.fillRect(image_right, image_y,
+                                         print_right - image_right, image_h_px, _SHADOW_COLOR)
+            painter.drawPixmap(
+                image_x, image_y, self._render_preview(image_w_px, image_h_px)
+            )
         else:
-            painter.fillRect(print_x, print_y, print_w_px, print_h_px, QColor(225, 232, 240))
+            painter.fillRect(image_x, image_y, image_w_px, image_h_px, QColor(225, 232, 240))
             painter.setPen(QColor(140, 150, 160))
             painter.drawText(
-                QRect(print_x, print_y, print_w_px, print_h_px),
+                QRect(image_x, image_y, image_w_px, image_h_px),
                 Qt.AlignmentFlag.AlignCenter,
                 "No photo selected",
             )
@@ -242,6 +279,12 @@ class PhotoCanvas(QWidget):
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(print_x, print_y, print_w_px - 1, print_h_px - 1)
+
+        if any((top_px, right_px, bottom_px, left_px)):
+            pen = QPen(QColor(210, 105, 0), 2, Qt.PenStyle.DotLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(image_x, image_y, image_w_px - 1, image_h_px - 1)
 
         # Cut markers
         if is_custom and self._cut_markers:
@@ -318,8 +361,9 @@ class PhotoCanvas(QWidget):
     def _draw_info_overlay(self, painter: QPainter, canvas_w: int, canvas_h: int):
         info = self._photo_info
         pw, ph = info.get("pixel_w", 0), info.get("pixel_h", 0)
-        print_w_in = self._print_w_in
-        print_h_in = self._print_h_in
+        top_in, right_in, bottom_in, left_in = self._margins_in
+        print_w_in = max(0.01, self._print_w_in - left_in - right_in)
+        print_h_in = max(0.01, self._print_h_in - top_in - bottom_in)
 
         ppi = print_ppi(pw, ph, print_w_in, print_h_in) if pw and ph else 0
         quality = ppi_quality(ppi) if ppi else "low"
@@ -385,4 +429,3 @@ class PhotoCanvas(QWidget):
         painter.setPen(dpi_color)
         y = box_y + 8 + len(lines_normal) * line_h + fm.ascent()
         painter.drawText(box_x + 8, y, dpi_line)
-

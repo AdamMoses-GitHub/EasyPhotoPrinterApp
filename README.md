@@ -22,8 +22,11 @@ Repository: https://github.com/AdamMoses-GitHub/EasyPhotoPrinterApp
 
 - Loads multiple photos at once and displays selectable thumbnails.
 - Previews a paper canvas with a centered print area before printing.
+- Organizes defaults and per-photo overrides in a resizable, scrollable settings sidebar with collapsible sections.
 - Supports three fit modes: Fill (crop), Fit (letterbox), and Stretch.
+- Adds optional inch or percentage margins, including independent edge settings, inside the selected print size.
 - Allows per-photo fit overrides while keeping a global default.
+- Offers full color, 256-color, 16-color, grayscale, and black-and-white output, with optional dithering and per-photo overrides.
 - Lets you drag to pan crop position in Fill mode and reset crop per photo.
 - Prints all loaded photos in one run, with optional auto orientation per image.
 
@@ -32,7 +35,8 @@ Repository: https://github.com/AdamMoses-GitHub/EasyPhotoPrinterApp
 - Uses Qt's print stack (QPrinter/QPrintDialog/QPageLayout) with per-page orientation handling.
 - Renders print images through Pillow with Lanczos resampling for quality.
 - Caps effective print DPI to avoid extreme memory usage during rasterization.
-- Persists user settings (paper, orientation, fit mode, custom area) via QSettings.
+- Persists user settings (paper, orientation, fit mode, custom area, margin) via QSettings.
+- Remembers global color mode and dithering; applies shared Pillow processing to preview and print without changing originals.
 - Displays in-app metadata overlays including ratio, file stats, and effective print PPI quality.
 
 ## Quick Start (TL;DR)

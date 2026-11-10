@@ -2,7 +2,24 @@ from math import gcd
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
+from PIL import ImageOps
 from PIL.ExifTags import TAGS
+
+
+def load_oriented_image(path: str) -> Image.Image:
+    """Load an image with its EXIF display orientation applied."""
+    with Image.open(path) as img:
+        return ImageOps.exif_transpose(img).copy()
+
+
+def oriented_image_size(path: str) -> tuple[int, int]:
+    """Return image dimensions after applying its EXIF display orientation."""
+    with Image.open(path) as img:
+        width, height = img.size
+        orientation = img.getexif().get(274)
+    if orientation in (5, 6, 7, 8):
+        return height, width
+    return width, height
 
 
 def _simplify_ratio(w: int, h: int) -> tuple[int, int]:
@@ -57,9 +74,11 @@ def read_photo_info(path: str) -> dict:
 
     try:
         with Image.open(path) as img:
-            info["pixel_w"], info["pixel_h"] = img.size
+            info["pixel_w"], info["pixel_h"] = ImageOps.exif_transpose(img).size
             info["color_mode"] = img.mode
-            info["ratio"] = _closest_simple_ratio(img.width, img.height)
+            info["ratio"] = _closest_simple_ratio(
+                info["pixel_w"], info["pixel_h"],
+            )
 
             # Embedded DPI (may be unreliable for camera JPEGs)
             if hasattr(img, "info") and "dpi" in img.info:
@@ -70,7 +89,7 @@ def read_photo_info(path: str) -> dict:
 
             # EXIF
             try:
-                raw_exif = img._getexif()  # JPEG only
+                raw_exif = img.getexif()
                 if raw_exif:
                     exif = {TAGS.get(k, k): v for k, v in raw_exif.items()}
                     info["camera_make"] = exif.get("Make", "").strip() or None
