@@ -176,19 +176,18 @@ class ColorUiTests(unittest.TestCase):
         self.assertFalse(restored._effective_dither(0))
         self.assertEqual(restored._photo_colors, {})
 
-    def test_sidebar_groups_controls_without_duplicating_toolbar(self):
+    def test_sidebar_contains_actions_and_settings_without_toolbar(self):
         window = self.window
         toolbars = window.findChildren(QToolBar)
-        self.assertEqual(len(toolbars), 1)
-        toolbar = toolbars[0]
-        self.assertEqual(
-            [button.text()
-             for action in toolbar.actions()
-             if isinstance(button := toolbar.widgetForAction(action), QPushButton)],
-            ["Open Photos\u2026", "Clear All", "Print All"],
-        )
+        self.assertEqual(toolbars, [])
         sidebar = window._settings_scroll.widget()
         assert sidebar is not None
+        self.assertEqual(
+            [window._open_btn.text(), window._clear_btn.text(), window._print_btn.text()],
+            ["Open Photos\u2026", "Clear All", "Print All"],
+        )
+        for control in (window._open_btn, window._clear_btn, window._print_btn):
+            self.assertTrue(sidebar.isAncestorOf(control))
         for control in (
             window._paper_combo, window._orient_combo, window._size_mode_combo,
             window._area_w_spin, window._area_h_spin, window._margin_edges_btn,
@@ -197,9 +196,24 @@ class ColorUiTests(unittest.TestCase):
             window._photo_dither_combo, window._reset_crop_btn,
         ):
             self.assertTrue(sidebar.isAncestorOf(control))
-            self.assertFalse(toolbar.isAncestorOf(control))
         headings = {label.text() for label in sidebar.findChildren(QLabel)}
         self.assertTrue({"All photos", "Selected photo"} <= headings)
+        self.assertFalse(sidebar.isAncestorOf(window._thumb_bar))
+        central_layout = window.centralWidget().layout()
+        self.assertEqual(central_layout.itemAt(central_layout.count() - 1).widget(),
+                         window._photo_browser_splitter)
+        self.assertEqual(
+            window._thumb_bar.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded,
+        )
+        self.assertEqual(
+            window._photo_browser_splitter.orientation(),
+            Qt.Orientation.Vertical,
+        )
+        self.assertEqual(window._photo_browser_splitter.widget(0),
+                         window._settings_splitter)
+        self.assertEqual(window._photo_browser_splitter.widget(1),
+                         window._thumb_bar)
         self.assertEqual(window._settings_splitter.widget(1), window._canvas)
 
     def test_about_action_opens_product_information(self):
@@ -441,9 +455,12 @@ class ColorUiTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         window._settings_splitter.setSizes([420, 680])
+        window._photo_browser_splitter.setSizes([600, 200])
         self.app.processEvents()
         expected_width = window._settings_splitter.sizes()[0]
+        expected_browser_height = window._photo_browser_splitter.sizes()[1]
         window._save_splitter_state(0, 0)
+        window._save_photo_browser_splitter_state(0, 0)
 
         restored = MainWindow()
         self.addCleanup(restored.close)
@@ -451,6 +468,35 @@ class ColorUiTests(unittest.TestCase):
         restored.show()
         self.app.processEvents()
         self.assertEqual(restored._settings_splitter.sizes()[0], expected_width)
+        self.assertEqual(
+            restored._photo_browser_splitter.sizes()[1],
+            expected_browser_height,
+        )
+
+    def test_photo_browser_resize_adapts_thumbnail_size(self):
+        window = self.window
+        window.resize(1000, 900)
+        window.show()
+        self.app.processEvents()
+
+        ready = QSignalSpy(window._thumb_bar.thumbnails_ready)
+        window._thumb_bar.set_photos([str(self.path)])
+        if ready.count() == 0:
+            self.assertTrue(ready.wait(5000))
+
+        splitter = window._photo_browser_splitter
+        splitter.setSizes([600, 220])
+        self.app.processEvents()
+        large_height = splitter.sizes()[1]
+        large_thumbnail = window._thumb_bar._items[0].pixmap().height()
+
+        splitter.setSizes([760, 80])
+        self.app.processEvents()
+        small_height = splitter.sizes()[1]
+        small_thumbnail = window._thumb_bar._items[0].pixmap().height()
+
+        self.assertGreater(large_height, small_height)
+        self.assertGreater(large_thumbnail, small_thumbnail)
 
     def test_preview_load_error_is_visible(self):
         with patch("ui.main_window.QMessageBox.warning") as warning:

@@ -48,12 +48,17 @@ python main.py
 
 ### Window Layout
 
-- The top toolbar keeps Open Photos, Clear All, and Print All within easy reach.
+- Open Photos, Clear All, Print All, photo thumbnails, and settings are all in
+  the left sidebar, except the photo browser, which spans the bottom of the
+  application below the sidebar and preview. There is no top toolbar.
+- Drag the divider above the photo browser to resize it; thumbnails scale to
+  fit the browser height.
 - The left settings sidebar separates All photos defaults from Selected photo overrides.
+- Scroll the bottom photo strip to reach more photos.
 - Under All photos, expand or collapse Paper, Layout, and Appearance using their
   arrow buttons. Layout starts collapsed; expand it for print size, margins, and cut markers.
-- Drag the divider between the sidebar and preview to resize them. Scroll the
-  sidebar when settings do not fit; the preview and thumbnail strip stay in place.
+- Click a thumbnail in the bottom photo strip to switch photos. Drag the divider
+  between the sidebar and preview to resize them; scroll the sidebar when needed.
 - The View menu still controls paper and crop shadows.
 
 ### 1) Batch Load and Preview
@@ -64,7 +69,7 @@ Workflow:
 
 1. Click Open Photos....
 2. Select one or more image files (JPG/PNG/BMP/TIFF/WebP).
-3. Use the thumbnail strip to switch between photos.
+3. Use the photo strip along the bottom to switch between photos.
 4. Confirm each image in the main canvas preview.
 5. Check metadata and print PPI overlay in the lower-left area.
 
@@ -79,7 +84,7 @@ Scenario: A portrait photo gets awkwardly cropped when printed on 4x6 paper.
 Workflow:
 
 1. Set global Fit to Fill (crop), Fit (letterbox), or Stretch.
-2. Select a photo in the thumbnail bar.
+2. Select a photo from the bottom photo strip.
 3. Use Fit under Selected photo in the sidebar to override only that image if needed.
 4. In Fill mode, drag inside the print area to adjust crop framing.
 5. Click Reset crop to recenter if the framing goes off-track.
@@ -185,7 +190,7 @@ EasyPhotoPrinterApp/
 
 - config/: Editable JSON presets for paper sizes.
 - core/: Image rendering logic and metadata/PPI calculations.
-- ui/: Main window, preview canvas, thumbnail strip, and print actions.
+- ui/: Main window, preview canvas, bottom photo strip, and print actions.
 
 ### Tests and Style
 

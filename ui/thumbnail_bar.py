@@ -4,8 +4,11 @@ from PySide6.QtCore import Qt, Signal, QObject, QRunnable, QThreadPool
 from PySide6.QtGui import QImage, QPixmap
 
 THUMB_SIZE = 80
+MIN_THUMB_SIZE = 40
+MAX_THUMB_SIZE = 256
 THUMB_BORDER = 2
-ITEM_SIZE = THUMB_SIZE + THUMB_BORDER * 2 + 4  # padding
+ITEM_PADDING = THUMB_BORDER * 2 + 4
+ITEM_SIZE = THUMB_SIZE + ITEM_PADDING
 
 
 class _ThumbnailSignals(QObject):
@@ -24,7 +27,7 @@ class _ThumbnailLoader(QRunnable):
         try:
             with Image.open(self._path) as source:
                 source.thumbnail(
-                    (THUMB_SIZE, THUMB_SIZE), Image.Resampling.LANCZOS,
+                    (MAX_THUMB_SIZE, MAX_THUMB_SIZE), Image.Resampling.LANCZOS,
                 )
                 image = ImageOps.exif_transpose(source).convert("RGB")
             thumbnail = (image.width, image.height, image.tobytes())
@@ -40,14 +43,27 @@ class _ThumbnailLoader(QRunnable):
 class _ThumbnailItem(QLabel):
     clicked = Signal(int)
 
-    def __init__(self, index: int, parent=None):
+    def __init__(self, index: int, thumbnail_size: int, parent=None):
         super().__init__(parent)
         self._index = index
-        self.setFixedSize(ITEM_SIZE, ITEM_SIZE)
+        self._thumbnail_size = thumbnail_size
+        self._source_pixmap: QPixmap | None = None
+        self._set_item_size()
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setText("Loading...")
         self._set_style(False)
+
+    def set_thumbnail_size(self, size: int):
+        if size == self._thumbnail_size:
+            return
+        self._thumbnail_size = size
+        self._set_item_size()
+        self._update_pixmap()
+
+    def _set_item_size(self):
+        item_size = self._thumbnail_size + ITEM_PADDING
+        self.setFixedSize(item_size, item_size)
 
     def set_thumbnail(self, data: tuple[int, int, bytes] | None, error: str):
         if data is None:
@@ -58,13 +74,19 @@ class _ThumbnailItem(QLabel):
         image = QImage(
             pixels, width, height, width * 3, QImage.Format.Format_RGB888,
         ).copy()
-        pixmap = QPixmap.fromImage(image).scaled(
-            THUMB_SIZE, THUMB_SIZE,
+        self._source_pixmap = QPixmap.fromImage(image)
+        self._update_pixmap()
+        self.setText("")
+        self.setToolTip("")
+
+    def _update_pixmap(self):
+        if self._source_pixmap is None:
+            return
+        pixmap = self._source_pixmap.scaled(
+            self._thumbnail_size, self._thumbnail_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        self.setText("")
-        self.setToolTip("")
         self.setPixmap(pixmap)
 
     def set_selected(self, selected: bool):
@@ -85,31 +107,35 @@ class _ThumbnailItem(QLabel):
 
 
 class ThumbnailBar(QScrollArea):
-    """Horizontal scrollable strip of photo thumbnails."""
+    """Horizontal photo strip displayed along the bottom of the window."""
 
     photo_selected = Signal(int, str)  # (index, path)
     thumbnails_ready = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(ITEM_SIZE + 16)
+        self.setMinimumHeight(
+            MIN_THUMB_SIZE + ITEM_PADDING + 8
+            + self.horizontalScrollBar().sizeHint().height()
+        )
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
+        self._thumbnail_size = THUMB_SIZE
 
         self._container = QWidget()
         self._layout = QHBoxLayout(self._container)
         self._layout.setContentsMargins(6, 4, 6, 4)
         self._layout.setSpacing(6)
         self._layout.addStretch()
-        self.setWidget(self._container)
 
         self._items: list[_ThumbnailItem] = []
         self._paths: list[str] = []
         self._selected_index: int = -1
         self._generation = 0
         self._completed = 0
+        self.setWidget(self._container)
 
     def set_photos(self, paths: list[str]):
         self._generation += 1
@@ -121,9 +147,10 @@ class ThumbnailBar(QScrollArea):
         self._items.clear()
         self._paths = list(paths)
         self._selected_index = -1
+        self._update_thumbnail_size()
 
         for i, path in enumerate(paths):
-            item = _ThumbnailItem(i)
+            item = _ThumbnailItem(i, self._thumbnail_size)
             item.clicked.connect(self._on_item_clicked)
             self._layout.insertWidget(self._layout.count() - 1, item)
             self._items.append(item)
@@ -133,6 +160,24 @@ class ThumbnailBar(QScrollArea):
 
         if self._items:
             self._select(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_thumbnail_size()
+
+    def _update_thumbnail_size(self):
+        available_height = (
+            self.viewport().height()
+            - self._layout.contentsMargins().top()
+            - self._layout.contentsMargins().bottom()
+            - ITEM_PADDING
+        )
+        size = max(MIN_THUMB_SIZE, min(MAX_THUMB_SIZE, available_height))
+        if size == self._thumbnail_size:
+            return
+        self._thumbnail_size = size
+        for item in self._items:
+            item.set_thumbnail_size(size)
 
     def _on_thumbnail_loaded(
         self, generation: int, index: int, path: str,

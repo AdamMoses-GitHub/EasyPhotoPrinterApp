@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QToolBar,
+    QMainWindow, QWidget, QVBoxLayout,
     QComboBox, QLabel, QDoubleSpinBox, QPushButton,
     QFileDialog, QCheckBox, QMessageBox, QStatusBar, QFrame,
     QDialog, QApplication, QMenu, QToolButton, QWidgetAction, QFormLayout, QSizePolicy,
@@ -79,7 +79,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.addToolBar(self._build_toolbar())
         self._build_menu_bar()
 
         self._settings_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -98,16 +97,20 @@ class MainWindow(QMainWindow):
         self._settings_splitter.setStretchFactor(1, 1)
         self._settings_splitter.setSizes([300, 660])
         self._settings_splitter.splitterMoved.connect(self._save_splitter_state)
-        layout.addWidget(self._settings_splitter, stretch=1)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addWidget(sep)
+        self._photo_browser_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._photo_browser_splitter.setChildrenCollapsible(False)
+        self._photo_browser_splitter.addWidget(self._settings_splitter)
 
         self._thumb_bar = ThumbnailBar()
         self._thumb_bar.photo_selected.connect(self._on_photo_selected)
-        layout.addWidget(self._thumb_bar)
+        self._photo_browser_splitter.addWidget(self._thumb_bar)
+        self._photo_browser_splitter.setStretchFactor(0, 1)
+        self._photo_browser_splitter.setStretchFactor(1, 0)
+        self._photo_browser_splitter.setSizes([560, 100])
+        self._photo_browser_splitter.splitterMoved.connect(
+            self._save_photo_browser_splitter_state,
+        )
+        layout.addWidget(self._photo_browser_splitter, stretch=1)
 
         self.setStatusBar(QStatusBar())
 
@@ -116,6 +119,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(8)
+        layout.addWidget(self._build_action_buttons())
+
         heading = QLabel("All photos")
         font = heading.font()
         font.setBold(True)
@@ -132,12 +137,34 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addWidget(self._build_photo_settings())
+
         layout.addStretch()
         for combo in sidebar.findChildren(QComboBox):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(16)
             combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         return sidebar
+
+    def _build_action_buttons(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._open_btn = QPushButton("Open Photos…")
+        self._open_btn.clicked.connect(self._open_photos)
+        layout.addWidget(self._open_btn)
+
+        self._clear_btn = QPushButton("Clear All")
+        self._clear_btn.setEnabled(False)
+        self._clear_btn.clicked.connect(self._clear_photos)
+        layout.addWidget(self._clear_btn)
+
+        self._print_btn = QPushButton("Print All")
+        self._print_btn.setEnabled(False)
+        self._print_btn.clicked.connect(self._print_all)
+        layout.addWidget(self._print_btn)
+        return panel
 
     def _add_settings_section(self, layout: QVBoxLayout, title: str, content: QWidget,
                               expanded: bool = True):
@@ -220,31 +247,6 @@ class MainWindow(QMainWindow):
             '<p><a href="https://github.com/AdamMoses-GitHub/EasyPhotoPrinterApp">'
             "Project website</a></p>",
         )
-
-    def _build_toolbar(self) -> QToolBar:
-        tb = QToolBar("Main")
-        tb.setMovable(False)
-        tb.setFloatable(False)
-
-        open_btn = QPushButton("Open Photos…")
-        open_btn.clicked.connect(self._open_photos)
-        tb.addWidget(open_btn)
-
-        self._clear_btn = QPushButton("Clear All")
-        self._clear_btn.setEnabled(False)
-        self._clear_btn.clicked.connect(self._clear_photos)
-        tb.addWidget(self._clear_btn)
-
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
-
-        self._print_btn = QPushButton("Print All")
-        self._print_btn.setEnabled(False)
-        self._print_btn.clicked.connect(self._print_all)
-        tb.addWidget(self._print_btn)
-
-        return tb
 
     def _build_paper_settings(self) -> QWidget:
         panel = QWidget()
@@ -413,6 +415,11 @@ class MainWindow(QMainWindow):
         splitter_state = self._settings.value("settings_splitter_state")
         if splitter_state is not None:
             self._settings_splitter.restoreState(splitter_state)
+        photo_browser_splitter_state = self._settings.value(
+            "photo_browser_splitter_state",
+        )
+        if photo_browser_splitter_state is not None:
+            self._photo_browser_splitter.restoreState(photo_browser_splitter_state)
 
         self._global_color_combo.blockSignals(True)
         idx = self._global_color_combo.findText(global_color)
@@ -498,6 +505,9 @@ class MainWindow(QMainWindow):
         self._settings.setValue(
             "settings_splitter_state", self._settings_splitter.saveState(),
         )
+        self._settings.setValue(
+            "photo_browser_splitter_state", self._photo_browser_splitter.saveState(),
+        )
         self._settings.setValue("paper_index", self._paper_combo.currentIndex())
         self._settings.setValue("full_paper", self._is_full_paper())
         self._settings.setValue("area_w", self._area_w_spin.value())
@@ -517,6 +527,11 @@ class MainWindow(QMainWindow):
     def _save_splitter_state(self, _position: int, _index: int):
         self._settings.setValue(
             "settings_splitter_state", self._settings_splitter.saveState(),
+        )
+
+    def _save_photo_browser_splitter_state(self, _position: int, _index: int):
+        self._settings.setValue(
+            "photo_browser_splitter_state", self._photo_browser_splitter.saveState(),
         )
 
     # ------------------------------------------------------------------
