@@ -5,6 +5,10 @@
 This tool lets you:
 
 - Load a batch of photos and switch between them via thumbnails.
+- Add photos by dragging files onto the window, remove individual photos, and reorder the batch by dragging thumbnails.
+- Filter thumbnails by filename or sort the browser by name or file modification date.
+- Use keyboard shortcuts to open, print, remove, clear, and navigate photos.
+- Track print progress and review sent/failed counts in the print summary.
 - Generate thumbnails in the background so loading a batch stays responsive.
 - Apply embedded photo orientation consistently in the preview and printed output.
 - Preview paper size, print area, and fit mode before printing.
@@ -48,11 +52,13 @@ python main.py
 
 ### Window Layout
 
-- Open Photos, Clear All, Print All, photo thumbnails, and settings are all in
-  the left sidebar, except the photo browser, which spans the bottom of the
-  application below the sidebar and preview. There is no top toolbar.
+- Open Photos, Clear All, Print All, Remove Photo, and settings are in the left
+  sidebar. The photo browser spans the bottom of the application below the
+  sidebar and preview. There is no top toolbar.
 - Drag the divider above the photo browser to resize it; thumbnails scale to
   fit the browser height.
+- The browser shows filenames and can filter by filename or sort by name/date.
+  Sorting changes only the browser display; Custom order controls print order.
 - The left settings sidebar separates All photos defaults from Selected photo overrides.
 - Scroll the bottom photo strip to reach more photos.
 - Under All photos, expand or collapse Paper, Layout, and Appearance using their
@@ -67,11 +73,14 @@ Scenario: You have a folder of event photos and want to print a curated subset q
 
 Workflow:
 
-1. Click Open Photos....
+1. Click Open Photos... to replace the current batch, or drag image files onto
+   the window to append them.
 2. Select one or more image files (JPG/PNG/BMP/TIFF/WebP).
 3. Use the photo strip along the bottom to switch between photos.
-4. Confirm each image in the main canvas preview.
-5. Check metadata and print PPI overlay in the lower-left area.
+4. Drag thumbnails in Custom order to change print order, or use Remove Photo
+   in the sidebar to discard the selected image.
+5. Confirm each image in the main canvas preview.
+6. Check metadata and print PPI overlay in the lower-left area.
 
 Example Use Case:
 
@@ -137,11 +146,22 @@ Workflow:
 2. Set Orientation to Portrait, Landscape, or Auto.
 3. Click Print All.
 4. Confirm printer and settings in the system print dialog.
-5. Monitor status messages while pages are sent.
+5. Monitor the progress dialog and review the sent/failed count when printing ends.
 
 Example Use Case:
 
 A mixed phone-photo batch prints in one pass, with Auto orientation reducing wrong-rotation pages.
+
+### Keyboard Shortcuts
+
+- Ctrl+O: Open photos and replace the current batch.
+- Ctrl+P: Print all photos.
+- Alt+Left / Alt+Right: Select the previous or next photo.
+- Ctrl+Shift+Backspace: Remove the selected photo.
+- Ctrl+Shift+Del: Clear the entire batch.
+- Dragging thumbnails while Custom order is selected changes the order used for printing.
+- Filename filtering and name/date sorting affect the browser display only; filtered photos
+  remain in the print batch.
 
 ### 6) Color Mode and Dithering
 

@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QEvent, QMimeData, QPoint, QPointF, QSettings, QThreadPool, Qt, QUrl
 from PySide6.QtWidgets import QApplication, QDialog, QToolBar, QToolButton, QLabel, QPushButton
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtTest import QSignalSpy
@@ -19,6 +19,7 @@ from core.image_processor import (
 )
 from core.photo_info import read_photo_info
 from ui.main_window import MainWindow
+from ui.thumbnail_bar import REORDER_MIME
 
 
 def gradient() -> Image.Image:
@@ -138,6 +139,21 @@ class ColorUiTests(unittest.TestCase):
         self.addCleanup(self.window.close)
         self.window._photo_paths = [str(self.path), str(self.path)]
         self.window._thumb_bar.set_photos(self.window._photo_paths)
+        self._wait_for_thumbnails(self.window._thumb_bar)
+
+    def _make_photo_files(self, *names: str) -> list[str]:
+        paths = []
+        for name in names:
+            path = self.folder / name
+            gradient().save(path)
+            paths.append(str(path))
+        return paths
+
+    def _wait_for_thumbnails(self, bar):
+        if bar._pending_tokens:
+            self.assertTrue(QThreadPool.globalInstance().waitForDone(5000))
+            self.app.processEvents()
+            self.assertFalse(bar._pending_tokens)
 
     def test_global_overrides_and_dithering_controls(self):
         window = self.window
@@ -186,7 +202,10 @@ class ColorUiTests(unittest.TestCase):
             [window._open_btn.text(), window._clear_btn.text(), window._print_btn.text()],
             ["Open Photos\u2026", "Clear All", "Print All"],
         )
-        for control in (window._open_btn, window._clear_btn, window._print_btn):
+        for control in (
+            window._open_btn, window._clear_btn, window._print_btn,
+            window._remove_photo_btn,
+        ):
             self.assertTrue(sidebar.isAncestorOf(control))
         for control in (
             window._paper_combo, window._orient_combo, window._size_mode_combo,
@@ -213,8 +232,210 @@ class ColorUiTests(unittest.TestCase):
         self.assertEqual(window._photo_browser_splitter.widget(0),
                          window._settings_splitter)
         self.assertEqual(window._photo_browser_splitter.widget(1),
-                         window._thumb_bar)
+                         window._photo_browser)
+        self.assertFalse(sidebar.isAncestorOf(window._photo_filter))
+        self.assertFalse(sidebar.isAncestorOf(window._photo_sort))
         self.assertEqual(window._settings_splitter.widget(1), window._canvas)
+
+    def test_drag_drop_appends_supported_photos_without_duplicates(self):
+        extra, = self._make_photo_files("extra.png")
+        mime_data = QMimeData()
+        mime_data.setUrls([
+            QUrl.fromLocalFile(extra),
+            QUrl.fromLocalFile(str(self.path)),
+        ])
+
+        class DropEvent:
+            def __init__(self, data):
+                self._data = data
+                self.accepted = False
+
+            def mimeData(self):
+                return self._data
+
+            def acceptProposedAction(self):
+                self.accepted = True
+
+            def ignore(self):
+                self.accepted = False
+
+        event = DropEvent(mime_data)
+        self.window.dragEnterEvent(event)
+        self.assertTrue(event.accepted)
+        self.window.dropEvent(event)
+        self._wait_for_thumbnails(self.window._thumb_bar)
+        self.assertEqual(
+            self.window._photo_paths,
+            [str(self.path), str(self.path), extra],
+        )
+        self.assertIn("Added 1 photo(s)", self.window.statusBar().currentMessage())
+
+    def test_remove_photo_remaps_per_photo_settings(self):
+        first, second, third = self._make_photo_files(
+            "first.png", "second.png", "third.png",
+        )
+        window = self.window
+        window._photo_paths = [first, second, third]
+        window._thumb_bar.set_photos(window._photo_paths)
+        self._wait_for_thumbnails(window._thumb_bar)
+        window._photo_overrides = {
+            0: FitMode.FILL.value,
+            1: FitMode.FIT.value,
+            2: FitMode.STRETCH.value,
+        }
+        window._photo_pans = {0: (0.0, 0.0), 1: (0.25, 0.5), 2: (-0.5, 0.25)}
+        window._photo_colors = {
+            0: ColorMode.FULL,
+            1: ColorMode.GRAYSCALE,
+            2: ColorMode.BLACK_WHITE,
+        }
+        window._photo_dithers = {1: True, 2: False}
+        window._thumb_bar._select(1)
+
+        window._remove_current_photo()
+
+        self.assertEqual(window._photo_paths, [first, third])
+        self.assertEqual(window._photo_overrides, {
+            0: FitMode.FILL.value,
+            1: FitMode.STRETCH.value,
+        })
+        self.assertEqual(window._photo_pans, {
+            0: (0.0, 0.0),
+            1: (-0.5, 0.25),
+        })
+        self.assertEqual(window._photo_colors, {
+            0: ColorMode.FULL,
+            1: ColorMode.BLACK_WHITE,
+        })
+        self.assertEqual(window._photo_dithers, {1: False})
+        self.assertEqual(window._current_index, 1)
+
+    def test_reordering_photos_preserves_settings_and_print_order(self):
+        first, second, third = self._make_photo_files(
+            "first.png", "second.png", "third.png",
+        )
+        window = self.window
+        window._photo_paths = [first, second, third]
+        window._thumb_bar.set_photos(window._photo_paths)
+        self._wait_for_thumbnails(window._thumb_bar)
+        window._photo_overrides = {
+            0: FitMode.FILL.value,
+            1: FitMode.FIT.value,
+            2: FitMode.STRETCH.value,
+        }
+        window._photo_pans = {0: (0.0, 0.0), 1: (0.25, 0.5), 2: (-0.5, 0.25)}
+
+        window._thumb_bar._reorder_photo(0, 2)
+
+        self.assertEqual(window._photo_paths, [second, third, first])
+        self.assertEqual(window._photo_overrides, {
+            0: FitMode.FIT.value,
+            1: FitMode.STRETCH.value,
+            2: FitMode.FILL.value,
+        })
+        self.assertEqual(window._photo_pans, {
+            0: (0.25, 0.5),
+            1: (-0.5, 0.25),
+            2: (0.0, 0.0),
+        })
+        self.assertEqual(window._current_index, 2)
+
+    def test_drag_drop_reorders_to_the_side_of_the_target_thumbnail(self):
+        first, second, third = self._make_photo_files(
+            "first.png", "second.png", "third.png",
+        )
+        window = self.window
+        window._photo_paths = [first, second, third]
+        window._thumb_bar.set_photos(window._photo_paths)
+        self._wait_for_thumbnails(window._thumb_bar)
+        window.show()
+        self.app.processEvents()
+        target = window._thumb_bar._items[2]
+        mime_data = QMimeData()
+        mime_data.setData(REORDER_MIME, b"0")
+
+        class DropEvent:
+            def type(self):
+                return QEvent.Type.Drop
+
+            def mimeData(self):
+                return mime_data
+
+            def position(self):
+                return QPointF(target.width() - 1, target.height() // 2)
+
+            def acceptProposedAction(self):
+                self.accepted = True
+
+            def ignore(self):
+                self.accepted = False
+
+        event = DropEvent()
+        self.assertTrue(window._thumb_bar.eventFilter(target, event))
+        self.assertTrue(event.accepted)
+        self.assertEqual(window._photo_paths, [second, third, first])
+
+    def test_photo_browser_filters_and_sorts_named_thumbnails(self):
+        paths = self._make_photo_files("zebra.png", "beta.png", "alpha.png")
+        os.utime(paths[0], (100, 100))
+        os.utime(paths[1], (300, 300))
+        os.utime(paths[2], (200, 200))
+        window = self.window
+        window.resize(1000, 800)
+        window.show()
+        self.app.processEvents()
+        window._thumb_bar.set_photos(paths)
+        self._wait_for_thumbnails(window._thumb_bar)
+
+        self.assertFalse(window._thumb_bar._empty_label.isVisible())
+        window._thumb_bar.set_sort_mode("name_asc")
+        display_order = [
+            window._thumb_bar._layout.itemAt(index).widget().path
+            for index in range(len(paths))
+        ]
+        self.assertEqual(
+            [Path(path).name for path in display_order],
+            ["alpha.png", "beta.png", "zebra.png"],
+        )
+        self.assertTrue(window._thumb_bar._items[2]._name_label.text())
+        self.assertEqual(
+            window._thumb_bar._items[2]._name_label.toolTip(),
+            "alpha.png",
+        )
+
+        window._thumb_bar.set_sort_mode("date_newest")
+        display_order = [
+            window._thumb_bar._layout.itemAt(index).widget().path
+            for index in range(len(paths))
+        ]
+        self.assertEqual(
+            [Path(path).name for path in display_order],
+            ["beta.png", "alpha.png", "zebra.png"],
+        )
+        window._thumb_bar.set_filter("BETA")
+        visible_items = [
+            item for item in window._thumb_bar._items if not item.isHidden()
+        ]
+        self.assertEqual([Path(item.path).name for item in visible_items], ["beta.png"])
+        self.assertEqual(visible_items[0]._name_label.toolTip(), "beta.png")
+        window._thumb_bar.set_filter("not-found")
+        self.assertTrue(window._thumb_bar._empty_label.isVisible())
+        self.assertEqual(
+            window._thumb_bar._empty_label.text(),
+            "No photos match that search.",
+        )
+
+    def test_photo_keyboard_shortcuts_navigate_and_clear_filter(self):
+        window = self.window
+        shortcuts = {shortcut.key().toString() for shortcut in window._shortcuts}
+        self.assertTrue({
+            "Ctrl+O", "Ctrl+P", "Ctrl+Shift+Backspace", "Ctrl+Shift+Del",
+            "Alt+Left", "Alt+Right",
+        } <= shortcuts)
+        window._photo_filter.setText("no match")
+        window._select_adjacent_photo(1)
+        self.assertEqual(window._photo_filter.text(), "")
+        self.assertEqual(window._current_index, 1)
 
     def test_about_action_opens_product_information(self):
         with patch("ui.main_window.QMessageBox.about") as show_about:
@@ -366,14 +587,20 @@ class ColorUiTests(unittest.TestCase):
             patch("ui.main_window.QPrinter", return_value=printer),
             patch("ui.main_window.QPrintDialog") as dialog,
             patch("ui.main_window.render_color_image", wraps=render_color_image) as render,
+            patch("ui.main_window.QMessageBox.information") as summary,
+            patch("ui.main_window.QProgressDialog") as progress,
         ):
             dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
+            progress.return_value.wasCanceled.return_value = False
             window._print_all()
         self.assertEqual(render.call_count, 2)
         self.assertEqual(render.call_args_list[0].args[6:], (ColorMode.BLACK_WHITE, False))
         self.assertEqual(render.call_args_list[1].args[6:], (ColorMode.GRAYSCALE, True))
         self.assertTrue(output.read_bytes().startswith(b"%PDF"))
-        self.assertIn("sent 2 photo(s)", window.statusBar().currentMessage())
+        self.assertIn("sent 2 of 2 photo(s)", window.statusBar().currentMessage())
+        self.assertIn("sent 2 of 2 photo(s)", summary.call_args.args[2])
+        self.assertEqual(progress.call_args.args[3], 2)
+        self.assertGreaterEqual(progress.return_value.setValue.call_count, 3)
         self.assertEqual(self.path.read_bytes(), self.original)
 
     def test_exif_orientation_is_used_for_preview_auto_orientation_and_print(self):
@@ -404,6 +631,7 @@ class ColorUiTests(unittest.TestCase):
             patch("ui.main_window.QPrinter", return_value=printer),
             patch("ui.main_window.QPrintDialog") as dialog,
             patch("ui.main_window.render_color_image", wraps=render_color_image) as render,
+            patch("ui.main_window.QMessageBox.information"),
         ):
             dialog.return_value.exec.return_value = QDialog.DialogCode.Accepted
             window._print_all()

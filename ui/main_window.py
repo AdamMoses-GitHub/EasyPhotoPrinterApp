@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -6,10 +7,13 @@ from PySide6.QtWidgets import (
     QComboBox, QLabel, QDoubleSpinBox, QPushButton,
     QFileDialog, QCheckBox, QMessageBox, QStatusBar, QFrame,
     QDialog, QApplication, QMenu, QToolButton, QWidgetAction, QFormLayout, QSizePolicy,
-    QScrollArea, QSplitter,
+    QScrollArea, QSplitter, QHBoxLayout, QLineEdit, QProgressDialog,
 )
-from PySide6.QtCore import Qt, QSettings, QSizeF, QMarginsF
-from PySide6.QtGui import QPainter, QImage, QPageSize, QPageLayout, QTransform, QPen, QColor
+from PySide6.QtCore import Qt, QSettings, QSizeF, QMarginsF, QEvent
+from PySide6.QtGui import (
+    QPainter, QImage, QPageSize, QPageLayout, QTransform, QPen, QColor,
+    QKeySequence, QShortcut,
+)
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog
 
 from ui.photo_canvas import PhotoCanvas
@@ -19,6 +23,7 @@ from core.photo_info import load_oriented_image, oriented_image_size, read_photo
 
 _CONFIG = Path(__file__).parent.parent / "config" / "paper_sizes.json"
 _MAX_PRINT_DPI = 600  # cap to keep memory/time reasonable
+_SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 _DEFAULT_PAPER_SIZES = [
     {"name": "3.5x5\"", "width_in": 3.5, "height_in": 5.0},
     {"name": "4x6\"", "width_in": 4.0, "height_in": 6.0},
@@ -66,6 +71,7 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("PrinterApp", "PrinterApp")
 
         self._build_ui()
+        self._build_keyboard_shortcuts()
         self._restore_settings()
 
     # ------------------------------------------------------------------
@@ -74,6 +80,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         central = QWidget()
+        central.setAcceptDrops(True)
+        central.installEventFilter(self)
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -101,18 +109,55 @@ class MainWindow(QMainWindow):
         self._photo_browser_splitter.setChildrenCollapsible(False)
         self._photo_browser_splitter.addWidget(self._settings_splitter)
 
+        self._photo_browser = QWidget()
+        browser_layout = QVBoxLayout(self._photo_browser)
+        browser_layout.setContentsMargins(8, 4, 8, 4)
+        browser_layout.setSpacing(4)
+        browser_controls = QHBoxLayout()
+        browser_controls.addWidget(QLabel("Photos"))
+        self._photo_filter = QLineEdit()
+        self._photo_filter.setClearButtonEnabled(True)
+        self._photo_filter.setPlaceholderText("Filter by filename")
+        self._photo_filter.textChanged.connect(self._thumb_filter_changed)
+        browser_controls.addWidget(self._photo_filter, stretch=1)
+        browser_controls.addWidget(QLabel("Sort:"))
+        self._photo_sort = QComboBox()
+        self._photo_sort.addItem("Custom order", "custom")
+        self._photo_sort.addItem("Name (A–Z)", "name_asc")
+        self._photo_sort.addItem("Name (Z–A)", "name_desc")
+        self._photo_sort.addItem("Newest first", "date_newest")
+        self._photo_sort.addItem("Oldest first", "date_oldest")
+        self._photo_sort.setToolTip(
+            "Sorting changes the browser display, not the print order. "
+            "Choose Custom order to drag photos into print order."
+        )
+        self._photo_sort.currentIndexChanged.connect(self._photo_sort_changed)
+        browser_controls.addWidget(self._photo_sort)
+        browser_layout.addLayout(browser_controls)
+
         self._thumb_bar = ThumbnailBar()
         self._thumb_bar.photo_selected.connect(self._on_photo_selected)
-        self._photo_browser_splitter.addWidget(self._thumb_bar)
+        self._thumb_bar.photos_reordered.connect(self._on_photos_reordered)
+        self._thumb_bar.files_dropped.connect(self._append_dropped_photos)
+        browser_layout.addWidget(self._thumb_bar, stretch=1)
+        self._photo_browser.setMinimumHeight(
+            self._thumb_bar.minimumHeight()
+            + browser_controls.sizeHint().height()
+            + browser_layout.spacing()
+            + browser_layout.contentsMargins().top()
+            + browser_layout.contentsMargins().bottom()
+        )
+        self._photo_browser_splitter.addWidget(self._photo_browser)
         self._photo_browser_splitter.setStretchFactor(0, 1)
         self._photo_browser_splitter.setStretchFactor(1, 0)
-        self._photo_browser_splitter.setSizes([560, 100])
+        self._photo_browser_splitter.setSizes([520, 140])
         self._photo_browser_splitter.splitterMoved.connect(
             self._save_photo_browser_splitter_state,
         )
         layout.addWidget(self._photo_browser_splitter, stretch=1)
 
         self.setStatusBar(QStatusBar())
+        self.setAcceptDrops(True)
 
     def _build_settings_sidebar(self) -> QWidget:
         sidebar = QWidget()
@@ -164,6 +209,11 @@ class MainWindow(QMainWindow):
         self._print_btn.setEnabled(False)
         self._print_btn.clicked.connect(self._print_all)
         layout.addWidget(self._print_btn)
+
+        self._remove_photo_btn = QPushButton("Remove Photo")
+        self._remove_photo_btn.setEnabled(False)
+        self._remove_photo_btn.clicked.connect(self._remove_current_photo)
+        layout.addWidget(self._remove_photo_btn)
         return panel
 
     def _add_settings_section(self, layout: QVBoxLayout, title: str, content: QWidget,
@@ -235,8 +285,38 @@ class MainWindow(QMainWindow):
         self._crop_shadow_action.toggled.connect(self._on_crop_shadow_toggled)
 
         help_menu: QMenu = self.menuBar().addMenu("&Help")
+        shortcuts_action = help_menu.addAction("Keyboard shortcuts")
+        shortcuts_action.triggered.connect(self._show_shortcuts)
+        help_menu.addSeparator()
         self._about_action = help_menu.addAction("&About EasyPhotoPrinter")
         self._about_action.triggered.connect(self._show_about)
+
+    def _build_keyboard_shortcuts(self):
+        shortcut_handlers = (
+            ("Ctrl+O", self._open_photos),
+            ("Ctrl+P", self._print_all),
+            ("Ctrl+Shift+Backspace", self._remove_current_photo),
+            ("Ctrl+Shift+Del", self._clear_photos),
+            ("Alt+Left", lambda: self._select_adjacent_photo(-1)),
+            ("Alt+Right", lambda: self._select_adjacent_photo(1)),
+        )
+        self._shortcuts: list[QShortcut] = []
+        for sequence, handler in shortcut_handlers:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(handler)
+            self._shortcuts.append(shortcut)
+
+    def _show_shortcuts(self):
+        QMessageBox.information(
+            self,
+            "Keyboard Shortcuts",
+            "Ctrl+O  Open photos\n"
+            "Ctrl+P  Print all\n"
+            "Alt+Left / Alt+Right  Previous / next photo\n"
+            "Ctrl+Shift+Backspace  Remove selected photo\n"
+            "Ctrl+Shift+Del  Clear all photos",
+        )
 
     def _show_about(self):
         QMessageBox.about(
@@ -538,6 +618,81 @@ class MainWindow(QMainWindow):
     # Slot handlers
     # ------------------------------------------------------------------
 
+    def dragEnterEvent(self, event):
+        if self._drop_photo_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = self._drop_photo_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        self._append_dropped_photos(paths)
+        event.acceptProposedAction()
+
+    def eventFilter(self, watched, event):
+        if watched is self.centralWidget() and event.type() in (
+            QEvent.Type.DragEnter,
+            QEvent.Type.Drop,
+        ):
+            if event.type() == QEvent.Type.DragEnter:
+                if self._drop_photo_paths(event.mimeData()):
+                    event.acceptProposedAction()
+                else:
+                    event.ignore()
+                return True
+            paths = self._drop_photo_paths(event.mimeData())
+            if paths:
+                self._append_dropped_photos(paths)
+                event.acceptProposedAction()
+            else:
+                event.ignore()
+            return True
+        return super().eventFilter(watched, event)
+
+    @staticmethod
+    def _drop_photo_paths(mime_data) -> list[str]:
+        if not mime_data.hasUrls():
+            return []
+        return [
+            url.toLocalFile()
+            for url in mime_data.urls()
+            if url.isLocalFile()
+            and Path(url.toLocalFile()).suffix.lower() in _SUPPORTED_IMAGE_SUFFIXES
+        ]
+
+    def _append_dropped_photos(self, paths: list[str]):
+        supported = [
+            str(Path(path))
+            for path in paths
+            if Path(path).suffix.lower() in _SUPPORTED_IMAGE_SUFFIXES
+            and Path(path).is_file()
+        ]
+        existing = {
+            os.path.normcase(os.path.abspath(path))
+            for path in self._photo_paths
+        }
+        added = []
+        for path in supported:
+            identity = os.path.normcase(os.path.abspath(path))
+            if identity not in existing:
+                existing.add(identity)
+                added.append(path)
+        if not added:
+            self.statusBar().showMessage(
+                "No new supported photo files were added."
+            )
+            return
+
+        self._photo_paths.extend(added)
+        self._thumb_bar.add_photos(added)
+        self._update_photo_action_buttons()
+        self.statusBar().showMessage(
+            f"Added {len(added)} photo(s); {len(self._photo_paths)} in the batch."
+        )
+
     def _open_photos(self):
         last_dir = self._settings.value("last_open_dir", "")
         paths, _ = QFileDialog.getOpenFileNames(
@@ -548,13 +703,15 @@ class MainWindow(QMainWindow):
             return
         self._settings.setValue("last_open_dir", str(Path(paths[0]).parent))
         self._photo_paths = paths
+        self._current_index = -1
         self._photo_overrides.clear()
         self._photo_pans.clear()
         self._photo_colors.clear()
         self._photo_dithers.clear()
+        self._photo_filter.clear()
+        self._photo_sort.setCurrentIndex(0)
         self._thumb_bar.set_photos(paths)
-        self._print_btn.setEnabled(True)
-        self._clear_btn.setEnabled(True)
+        self._update_photo_action_buttons()
         self.statusBar().showMessage(f"{len(paths)} photo(s) loaded")
 
     def _clear_photos(self):
@@ -577,12 +734,101 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
             combo.setEnabled(False)
         self._reset_crop_btn.setEnabled(False)
-        self._print_btn.setEnabled(False)
-        self._clear_btn.setEnabled(False)
+        self._photo_filter.clear()
+        self._photo_sort.setCurrentIndex(0)
+        self._update_photo_action_buttons()
         self.statusBar().showMessage("All photos cleared.")
+
+    def _remove_current_photo(self):
+        index = self._current_index
+        if not 0 <= index < len(self._photo_paths):
+            return
+        removed_name = Path(self._photo_paths[index]).name
+        old_count = len(self._photo_paths)
+        self._photo_paths.pop(index)
+        index_map = {
+            old_index: old_index if old_index < index else old_index - 1
+            for old_index in range(old_count)
+            if old_index != index
+        }
+        self._remap_photo_state_indices(index_map)
+        self._current_index = -1
+        self._thumb_bar.remove_photo(index)
+        if not self._photo_paths:
+            self._clear_photos()
+            self.statusBar().showMessage(f"Removed {removed_name}; no photos remain.")
+            return
+        self._update_photo_action_buttons()
+        self.statusBar().showMessage(
+            f"Removed {removed_name}; {len(self._photo_paths)} photo(s) remain."
+        )
+
+    def _on_photos_reordered(self, old_index: int, new_index: int):
+        if (
+            not 0 <= old_index < len(self._photo_paths)
+            or not 0 <= new_index < len(self._photo_paths)
+            or old_index == new_index
+        ):
+            return
+        count = len(self._photo_paths)
+        index_map = {}
+        for index in range(count):
+            if index == old_index:
+                index_map[index] = new_index
+            elif old_index < new_index and old_index < index <= new_index:
+                index_map[index] = index - 1
+            elif new_index < old_index and new_index <= index < old_index:
+                index_map[index] = index + 1
+            else:
+                index_map[index] = index
+        self._photo_paths.insert(new_index, self._photo_paths.pop(old_index))
+        self._remap_photo_state_indices(index_map)
+        if self._current_index in index_map:
+            self._current_index = index_map[self._current_index]
+
+    def _remap_photo_state_indices(self, index_map: dict[int, int]):
+        for attribute in (
+            "_photo_overrides", "_photo_pans", "_photo_colors", "_photo_dithers",
+        ):
+            current_state = getattr(self, attribute)
+            setattr(
+                self,
+                attribute,
+                {
+                    index_map[index]: value
+                    for index, value in current_state.items()
+                    if index in index_map
+                },
+            )
+
+    def _update_photo_action_buttons(self):
+        has_photos = bool(self._photo_paths)
+        self._print_btn.setEnabled(has_photos)
+        self._clear_btn.setEnabled(has_photos)
+        self._remove_photo_btn.setEnabled(
+            0 <= self._current_index < len(self._photo_paths)
+        )
+
+    def _thumb_filter_changed(self, text: str):
+        self._thumb_bar.set_filter(text)
+
+    def _photo_sort_changed(self, _index: int):
+        self._thumb_bar.set_sort_mode(str(self._photo_sort.currentData()))
+
+    def _select_adjacent_photo(self, offset: int):
+        if not self._photo_paths:
+            return
+        if self._photo_filter.text():
+            self._photo_filter.clear()
+        if self._current_index < 0:
+            index = 0 if offset > 0 else len(self._photo_paths) - 1
+        else:
+            index = (self._current_index + offset) % len(self._photo_paths)
+        self._thumb_bar.select_photo(index)
 
     def _on_photo_selected(self, index: int, path: str):
         self._current_index = index
+        self._update_photo_action_buttons()
         try:
             self._canvas.set_photo(path)
         except (OSError, ValueError) as exc:
@@ -871,7 +1117,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _print_all(self):
-        if not self._photo_paths:
+        photos = list(self._photo_paths)
+        if not photos:
             return
 
         paper = self._current_paper()
@@ -881,7 +1128,7 @@ class MainWindow(QMainWindow):
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
 
         # QPageSize always takes portrait dims (shorter side first)
-        first_path = self._photo_paths[0]
+        first_path = photos[0]
         eff_pw, eff_ph = self._effective_paper_dims(first_path)
         base_w_mm = min(paper["width_in"], paper["height_in"]) * 25.4
         base_h_mm = max(paper["width_in"], paper["height_in"]) * 25.4
@@ -922,8 +1169,37 @@ class MainWindow(QMainWindow):
 
         failures: list[str] = []
         page_started = False
+        sent_count = 0
+        processed_count = 0
+        cancelled = False
+        progress = QProgressDialog(
+            f"Preparing to print {len(photos)} photos…",
+            "Cancel",
+            0,
+            len(photos),
+            self,
+        )
+        progress.setWindowTitle(f"Printing {len(photos)} Photos")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        def _advance_progress(value: int):
+            progress.setValue(value)
+            QApplication.processEvents()
+
         try:
-            for i, path in enumerate(self._photo_paths):
+            for i, path in enumerate(photos):
+                progress.setLabelText(
+                    f"Printing photo {i + 1} of {len(photos)}: {Path(path).name}"
+                )
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    cancelled = True
+                    break
+
                 eff_pw, eff_ph = self._effective_paper_dims(path)
                 orient = (
                     QPageLayout.Orientation.Landscape
@@ -949,11 +1225,6 @@ class MainWindow(QMainWindow):
                 image_offset_x = offset_x + left_px
                 image_offset_y = offset_y + top_px
 
-                self.statusBar().showMessage(
-                    f"Printing {i + 1} / {len(self._photo_paths)}: {Path(path).name}…"
-                )
-                QApplication.processEvents()
-
                 try:
                     rgb = load_oriented_image(path).convert("RGB")
                     fit = self._effective_fit_mode(i)
@@ -971,6 +1242,8 @@ class MainWindow(QMainWindow):
                     ).copy()
                 except Exception as exc:
                     failures.append(f"{Path(path).name}: {exc}")
+                    processed_count += 1
+                    _advance_progress(processed_count)
                     continue
 
                 if page_started:
@@ -979,6 +1252,8 @@ class MainWindow(QMainWindow):
                     printer.setFullPage(True)
                     if not printer.newPage():
                         failures.append(f"{Path(path).name}: failed to start a new page.")
+                        processed_count += 1
+                        _advance_progress(processed_count)
                         continue
                     _apply_transform()  # newPage resets painter transform
                 elif i > 0:
@@ -989,6 +1264,7 @@ class MainWindow(QMainWindow):
                 page_started = True
 
                 painter.drawImage(image_offset_x, image_offset_y, qimg)
+                sent_count += 1
 
                 # Cut markers
                 if self._cut_markers_chk.isEnabled() and self._cut_markers_chk.isChecked():
@@ -1005,17 +1281,26 @@ class MainWindow(QMainWindow):
                     for cx, cy, dx, dy in corners:
                         painter.drawLine(cx + dx * gap_px, cy, cx + dx * (gap_px + mark_px), cy)
                         painter.drawLine(cx, cy + dy * gap_px, cx, cy + dy * (gap_px + mark_px))
+                processed_count += 1
+                _advance_progress(processed_count)
         finally:
             painter.end()
+            progress.close()
 
-        sent_count = len(self._photo_paths) - len(failures)
+        summary = (
+            f"{'Print canceled' if cancelled else 'Print complete'}: "
+            f"sent {sent_count} of {len(photos)} photo(s); "
+            f"{len(failures)} failed."
+        )
         if failures:
             preview = "\n".join(failures[:5])
             extra = "" if len(failures) <= 5 else f"\n...and {len(failures) - 5} more"
             QMessageBox.warning(
                 self,
-                "Some Photos Failed",
-                f"Sent {sent_count} of {len(self._photo_paths)} photo(s).\n\n"
+                "Print Summary",
+                f"{summary}\n\n"
                 f"Failed files:\n{preview}{extra}",
             )
-        self.statusBar().showMessage(f"Done: sent {sent_count} photo(s) to printer.")
+        else:
+            QMessageBox.information(self, "Print Summary", summary)
+        self.statusBar().showMessage(summary)

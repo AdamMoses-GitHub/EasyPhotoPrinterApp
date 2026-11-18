@@ -21,6 +21,9 @@ Repository: https://github.com/AdamMoses-GitHub/EasyPhotoPrinterApp
 ### The Main Features
 
 - Loads multiple photos at once and displays selectable thumbnails.
+- Adds photos by file dialog or drag-and-drop; remove individual photos and drag thumbnails to set print order.
+- Shows thumbnail filenames and supports filename filtering and sorting by name or modification date.
+- Includes keyboard shortcuts and print progress/summary reporting.
 - Previews a paper canvas with a centered print area before printing.
 - Organizes defaults and per-photo overrides in a resizable, scrollable settings sidebar with collapsible sections.
 - Supports three fit modes: Fill (crop), Fit (letterbox), and Stretch.
